@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.3 — 2026-09-12
+
+- Review round 2: QML `Process` now sets `clearEnvironment: true` with an
+  explicit `environment` allowlist (`PATH=/usr/bin:/bin`), so inherited
+  loader variables are gone before the first executable loads
+  (verified against installed Quickshell `Process` type info).
+- TOCTOU-free state IO: dir chain opened per-component with
+  `O_DIRECTORY|O_NOFOLLOW`, verified leaf fd retained; all reads,
+  exclusive temp creation, fsync and renameat are dirfd-relative
+  (`os.rename(..., src_dir_fd, dst_dir_fd)`); no path re-resolution
+  between check and use. Leaf dirs `0700` + uid-owned via fstat.
+
 ## 1.2.2 — 2026-09-12
 
 - Security baseline hardening (maintainer review): no `bash` left in the

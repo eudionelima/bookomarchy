@@ -462,9 +462,15 @@ Item {
 
   // Atomic save via stdin — no user data in argv, no shell quoting.
   // (ensure-dir is handled inside the helper itself; no bash here.)
+  // clearEnvironment wipes the inherited env BEFORE the first executable
+  // loads (loader injection happens earlier than any `env -i` cleanup);
+  // `environment` is the explicit allowlist. `env -i` in pyRun stays on
+  // as defense in depth.
   Process {
     id: saveProc
     stdinEnabled: true
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin:/bin" })
     property string payload: ""
     property string pendingMsg: "Saved"
     command: root.pyRun.concat([root.saveHelper])
@@ -481,6 +487,8 @@ Item {
 
   Process {
     id: ioProc
+    clearEnvironment: true
+    environment: ({ "PATH": "/usr/bin:/bin" })
     property string actionLabel: ""
     stdout: StdioCollector {
       waitForEnd: true

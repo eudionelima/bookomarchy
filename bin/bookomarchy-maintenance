@@ -6,13 +6,18 @@ passes an explicit import/export path. No network, no secrets.
 Zen sync only reads bookmark title/url/folder — never logins/cookies.
 
 Hardening (marketplace security baseline):
-- Fixed interpreter (/usr/bin/python3) + clean allowlist env (spawned via
-  `env -i` from Menu.qml). Env scrubbed again here as defense in depth.
+- Fixed interpreter (/usr/bin/python3) + clean allowlist env: spawned from
+  QML with clearEnvironment + `env -i`. Env scrubbed again here.
 - Hard wall-clock timeout per action via SIGALRM.
-- State dir verified symlink-free (nofollow), mode 0700, owned by our uid.
+- State dir opened once per component with O_DIRECTORY|O_NOFOLLOW and the
+  verified leaf fd is RETAINED: every bounded read, exclusive temp
+  creation, fsync and renameat is dirfd-relative — no path re-resolution
+  between check and use (no TOCTOU swap). Unpredictable tmp names protect
+  the leaf; parent identity comes from the held fd.
+- Leaf dirs mode 0700 + uid-owned (fstat). Backups O_EXCL|O_NOFOLLOW.
 - Bounded reads (import/jsonlz4/sqlite/profile), entry counts, field and
-  output sizes. Unpredictable O_EXCL tmp files + fsync + atomic replace.
-- Zen profile paths constrained inside ~/.config/zen.
+  output sizes. Zen profiles constrained inside ~/.config/zen; live
+  places.sqlite never opened (temp copy, read-only, short timeout).
 """
 import configparser
 import csv
@@ -21,6 +26,7 @@ import html as htmlmod
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -48,10 +54,7 @@ SCRUB_ENV = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "PYTHONPATH",
              "PYTHONHOME", "PYTHONSTARTUP", "BASH_ENV", "ENV", "ZDOTDIR",
              "PERL5LIB", "RUBYLIB", "NODE_PATH")
 
-DATA_DIR = None
-SRC = None
-SETTINGS = None
-BACKUP_DIR = None
+STATE = None
 ZEN_BASE = None
 
 BLOCKED_CMD = re.compile(r"(sudo\s|rm\s+-rf|chmod|chown|curl\s.*\|\s*sh|wget\s.*\|\s*sh|mkfs|dd\s+of=)", re.I)
@@ -69,96 +72,180 @@ def on_timeout(_signum, _frame):
     os._exit(124)
 
 
-def secure_home():
-    home = os.path.expanduser("~")
-    if not home or home == "~" or not os.path.isdir(home):
-        raise RuntimeError("cannot resolve home directory")
-    return home
+def _leaf_ok(name):
+    return bool(name) and "/" not in name and name not in (".", "..") \
+        and not name.startswith(".") and len(name) <= 128
 
 
-def secure_state_dir(path, home):
-    """Create/verify private nofollow state dir. Rejects symlinked components."""
-    if os.path.abspath(path) != os.path.abspath(
-            os.path.join(home, ".config", "omarchy", "bookomarchy")):
-        raise RuntimeError("unexpected state dir")
-    rel = os.path.relpath(path, home)
-    cur = home
-    for part in rel.split(os.sep):
-        if part in ("", ".", ".."):
-            raise RuntimeError("bad path component")
-        cur = os.path.join(cur, part)
+class StateFS:
+    """Verified state dir held by fd; all state IO dirfd-relative (no TOCTOU)."""
+
+    CHAIN = (".config", "omarchy", "bookomarchy")
+
+    def __init__(self, home):
+        base = os.path.realpath(home)
+        if not base or not os.path.isdir(base):
+            raise RuntimeError("cannot resolve home directory")
+        fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            st = os.lstat(cur)
-            if stat.S_ISLNK(st.st_mode):
-                raise RuntimeError(f"refusing symlinked component: {cur}")
-            if not stat.S_ISDIR(st.st_mode):
-                raise RuntimeError(f"not a directory: {cur}")
-        except FileNotFoundError:
-            os.mkdir(cur, 0o700)
-    os.chmod(path, 0o700)
-    st = os.stat(path)
-    if st.st_uid != os.getuid():
-        raise RuntimeError("state dir not owned by current user")
-    if os.path.realpath(path) != os.path.abspath(path):
-        raise RuntimeError("state dir resolves outside itself")
-    return path
-
-
-def init_state():
-    global DATA_DIR, SRC, SETTINGS, BACKUP_DIR, ZEN_BASE
-    home = secure_home()
-    DATA_DIR = secure_state_dir(
-        os.path.join(home, ".config", "omarchy", "bookomarchy"), home)
-    SRC = os.path.join(DATA_DIR, "bookmarks.json")
-    SETTINGS = os.path.join(DATA_DIR, "settings.json")
-    BACKUP_DIR = os.path.join(DATA_DIR, "backups")
-    ZEN_BASE = os.path.join(home, ".config", "zen")
-
-
-def atomic_write_bytes(dest, payload: bytes):
-    """Exclusive unpredictable tmp + fsync + atomic replace + dir fsync."""
-    if len(payload) > MAX_OUTPUT:
-        raise RuntimeError("output exceeds size limit")
-    d = os.path.dirname(os.path.abspath(dest))
-    if os.path.realpath(d) != os.path.abspath(d):
-        raise RuntimeError("refusing symlinked destination dir")
-    fd, tmp = tempfile.mkstemp(prefix=".bookomarchy-", suffix=".tmp", dir=d)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, dest)
-        tmp = None
-    finally:
-        if tmp is not None:
+            for part in self.CHAIN:
+                fd = self._child(fd, part, create=True, close_parent=True,
+                                 strict=False)
+            self._verify(fd, "state dir", strict=True)
+            self.fd = fd
+            self.bfd = self._child(fd, "backups", create=True,
+                                   close_parent=False, strict=True)
+            # Verified identity for git cwd (derived from held fd, resolved once).
+            self.path = os.readlink(f"/proc/self/fd/{fd}")
+        except BaseException:
             try:
-                os.unlink(tmp)
+                os.close(fd)
             except OSError:
                 pass
-    dirfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(dirfd)
-    finally:
-        os.close(dirfd)
+            raise
+
+    @staticmethod
+    def _verify(fd, what, strict):
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError(f"{what} is not a directory")
+        if st.st_uid != os.getuid():
+            raise RuntimeError(f"{what} not owned by current user")
+        if strict and stat.S_IMODE(st.st_mode) & 0o077:
+            os.fchmod(fd, 0o700)
+
+    def _child(self, parent_fd, name, create, close_parent, strict):
+        if name not in self.CHAIN and name != "backups" and not _leaf_ok(name):
+            raise RuntimeError(f"bad name: {name}")
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         dir_fd=parent_fd)
+        except FileNotFoundError:
+            if not create:
+                raise
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         dir_fd=parent_fd)
+        if close_parent:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+        self._verify(fd, name, strict)
+        return fd
+
+    def read(self, name, limit):
+        """Bounded read of a state file, dirfd-relative (no re-resolution)."""
+        if not _leaf_ok(name):
+            raise RuntimeError(f"bad name: {name}")
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                raise RuntimeError(f"refusing {name}")
+            if st.st_size > limit:
+                raise RuntimeError(f"{name} exceeds size limit")
+            chunks, total = [], 0
+            while True:
+                b = os.read(fd, 65536)
+                if not b:
+                    break
+                total += len(b)
+                if total > limit:
+                    raise RuntimeError(f"{name} exceeds size limit")
+                chunks.append(b)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    def write_atomic(self, name, payload: bytes):
+        """Exclusive unpredictable tmp + fsync + renameat + dir fsync."""
+        if not _leaf_ok(name):
+            raise RuntimeError(f"bad name: {name}")
+        if len(payload) > MAX_OUTPUT:
+            raise RuntimeError("output exceeds size limit")
+        for _ in range(5):
+            tmp = f".w-{secrets.token_hex(16)}.tmp"
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise RuntimeError("cannot allocate temp file")
+        try:
+            view = memoryview(payload)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.rename(tmp, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=self.fd)
+            except OSError:
+                pass
+            raise
+        os.fsync(self.fd)
+
+    def write_backup(self, name, payload: bytes):
+        """O_EXCL backup write inside held backups dir (no replace)."""
+        if not _leaf_ok(name):
+            raise RuntimeError(f"bad name: {name}")
+        if len(payload) > MAX_OUTPUT:
+            raise RuntimeError("output exceeds size limit")
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | os.O_NOFOLLOW, 0o600, dir_fd=self.bfd)
+        try:
+            view = memoryview(payload)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(self.bfd)
 
 
-def atomic_write_json(dest, obj):
-    payload = (json.dumps(obj, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    atomic_write_bytes(dest, payload)
-
-
-def read_file_bounded(path, limit):
+def read_plain_bounded(path, limit):
+    """Bounded read of an explicit user-supplied path (import/export target)."""
     st = os.stat(path)
     if not stat.S_ISREG(st.st_mode):
         raise RuntimeError(f"not a regular file: {path}")
     if st.st_size > limit:
-        raise RuntimeError(f"file exceeds size limit: {path}")
+        raise RuntimeError("file exceeds size limit")
     with open(path, "rb") as f:
         data = f.read(limit + 1)
     if len(data) > limit:
-        raise RuntimeError(f"file exceeds size limit: {path}")
+        raise RuntimeError("file exceeds size limit")
     return data
+
+
+def read_nofollow_bounded(path, limit):
+    """Bounded read refusing symlinks (browser/profile sources)."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"not a regular file: {path}")
+        if st.st_size > limit:
+            raise RuntimeError("file exceeds size limit")
+        chunks, total = [], 0
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            total += len(b)
+            if total > limit:
+                raise RuntimeError("file exceeds size limit")
+            chunks.append(b)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def check_entry(it):
@@ -242,9 +329,10 @@ def rule_category(title, url, fallback):
 
 
 def load():
-    if not os.path.exists(SRC):
+    try:
+        raw = STATE.read("bookmarks.json", MAX_OUTPUT)
+    except FileNotFoundError:
         return []
-    raw = read_file_bounded(SRC, MAX_OUTPUT)
     data = json.loads(raw.decode("utf-8"))
     items = data if isinstance(data, list) else data.get("bookmarks", [])
     if not isinstance(items, list) or len(items) > MAX_ITEMS:
@@ -257,14 +345,18 @@ def save(items):
         raise RuntimeError("too many bookmarks")
     for it in items:
         check_entry(it)
-    atomic_write_json(SRC, items)
+    STATE.write_atomic("bookmarks.json",
+                       (json.dumps(items, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
 def load_settings():
-    if not os.path.exists(SETTINGS):
+    try:
+        raw = STATE.read("settings.json", 1024 * 1024)
+    except FileNotFoundError:
+        return {}
+    except Exception:
         return {}
     try:
-        raw = read_file_bounded(SETTINGS, 1024 * 1024)
         s = json.loads(raw.decode("utf-8"))
         return s if isinstance(s, dict) else {}
     except Exception:
@@ -272,7 +364,8 @@ def load_settings():
 
 
 def save_settings(s):
-    atomic_write_json(SETTINGS, s)
+    STATE.write_atomic("settings.json",
+                       (json.dumps(s, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
 def normalize_url(t):
@@ -308,67 +401,55 @@ def slugify(title, existing_ids):
     return bid
 
 
-def backup_dest():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
+def backup_name():
     stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
-    dest = os.path.join(BACKUP_DIR, f"bookomarchy-backup-{stamp}.json")
-    if os.path.exists(dest):
-        dest = os.path.join(BACKUP_DIR, f"bookomarchy-backup-{stamp}-{os.getpid()}.json")
-    return dest
+    return f"bookomarchy-backup-{stamp}.json"
 
 
 def cmd_backup(_args):
-    dest = backup_dest()
-    data = read_file_bounded(SRC, MAX_OUTPUT)
-    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    data = STATE.read("bookmarks.json", MAX_OUTPUT)
+    name = backup_name()
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-    except BaseException:
-        try:
-            os.unlink(dest)
-        except OSError:
-            pass
-        raise
-    print(dest)
-
-
-def bounded_copy(src, dest, limit):
-    data = read_file_bounded(src, limit)
-    if os.path.dirname(os.path.abspath(dest)) == DATA_DIR:
-        atomic_write_bytes(dest, data)
-    else:  # explicit user target outside state dir
-        with open(dest, "wb") as f:
-            f.write(data)
-    print(dest)
+        STATE.write_backup(name, data)
+    except FileExistsError:
+        stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        name = f"bookomarchy-backup-{stamp}-{os.getpid()}.json"
+        STATE.write_backup(name, data)
+    print(os.path.join(STATE.path, "backups", name))
 
 
 def cmd_export_json(args):
-    dest = args[0] if args else os.path.join(DATA_DIR, "bookmarks-export.json")
-    dest = os.path.expanduser(dest)
-    bounded_copy(SRC, dest, MAX_OUTPUT)
+    data = STATE.read("bookmarks.json", MAX_OUTPUT)
+    if not args:
+        STATE.write_atomic("bookmarks-export.json", data)
+        print(os.path.join(STATE.path, "bookmarks-export.json"))
+        return
+    dest = os.path.expanduser(args[0])
+    with open(dest, "wb") as f:  # explicit user target
+        f.write(data)
+    print(dest)
 
 
 def cmd_export_html(args):
-    dest = args[0] if args else os.path.join(DATA_DIR, "bookmarks.html")
-    dest = os.path.expanduser(dest)
     items = load()
     parts = ["<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n<TITLE>BookOmarchy</TITLE>\n<H1>BookOmarchy</H1>\n<DL><p>\n"]
+    size = len(parts[0])
     for it in items:
         url = htmlmod.escape(str(it.get("target", ""))[:2048], quote=True)
         title = htmlmod.escape(str(it.get("title", ""))[:512])
         parts.append(f'    <DT><A HREF="{url}">{title}</A>\n')
-        if len("".join(parts)) > MAX_OUTPUT:
+        size += len(parts[-1])
+        if size > MAX_OUTPUT:
             raise RuntimeError("export exceeds size limit")
     parts.append("</DL><p>\n")
     payload = "".join(parts).encode("utf-8")
-    if os.path.dirname(os.path.abspath(dest)) == DATA_DIR:
-        atomic_write_bytes(dest, payload)
-    else:
-        with open(dest, "wb") as f:
-            f.write(payload)
+    if not args:
+        STATE.write_atomic("bookmarks.html", payload)
+        print(os.path.join(STATE.path, "bookmarks.html"))
+        return
+    dest = os.path.expanduser(args[0])
+    with open(dest, "wb") as f:  # explicit user target
+        f.write(payload)
     print(dest)
 
 
@@ -391,7 +472,7 @@ def cmd_import(args):
         print("usage: import <path.json|path.html|path.csv>", file=sys.stderr)
         return 1
     path = os.path.expanduser(args[0])
-    raw = read_file_bounded(path, MAX_IMPORT_FILE).decode("utf-8", errors="replace")
+    raw = read_plain_bounded(path, MAX_IMPORT_FILE).decode("utf-8", errors="replace")
     items = []
     if path.endswith(".html"):
         items = parse_html(raw)
@@ -451,8 +532,7 @@ def zen_profiles():
     if os.path.exists(ini):
         cp = configparser.ConfigParser()
         try:
-            for chunk in [read_file_bounded(ini, 1024 * 1024).decode("utf-8", errors="replace")]:
-                cp.read_string(chunk)
+            cp.read_string(read_nofollow_bounded(ini, 1024 * 1024).decode("utf-8", errors="replace"))
             for sec in cp.sections():
                 if sec.lower().startswith("profile"):
                     path = (cp[sec].get("Path") or "").strip()
@@ -560,7 +640,7 @@ def lz4_block_decompress(raw, max_out=MAX_LZ4_OUTPUT):
 
 
 def read_jsonlz4(path):
-    data = read_file_bounded(path, MAX_JSONLZ4_FILE)
+    data = read_nofollow_bounded(path, MAX_JSONLZ4_FILE)
     if data[:8] != b"mozLz40\0":
         raise ValueError("not mozlz4")
     body = data[8:]
@@ -644,27 +724,57 @@ def zen_from_backup(profile_path):
     return out, latest
 
 
+def copy_nofollow_bounded(src, dest, limit):
+    """Copy a browser source file refusing symlinks, with size cap."""
+    fd_in = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd_in)
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"not a regular file: {src}")
+        if st.st_size > limit:
+            raise RuntimeError(f"file exceeds size limit: {src}")
+        fd_out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            total = 0
+            while True:
+                b = os.read(fd_in, 65536)
+                if not b:
+                    break
+                total += len(b)
+                if total > limit:
+                    raise RuntimeError(f"file exceeds size limit: {src}")
+                view = memoryview(b)
+                while view:
+                    n = os.write(fd_out, view)
+                    view = view[n:]
+            os.fsync(fd_out)
+        finally:
+            os.close(fd_out)
+    finally:
+        os.close(fd_in)
+
+
 def zen_from_sqlite(profile_path):
     src = os.path.join(profile_path, "places.sqlite")
-    try:
-        if os.path.getsize(src) > MAX_SQLITE_FILE:
-            print("zen places.sqlite exceeds size limit", file=sys.stderr)
-            return [], None
-    except OSError:
+    if not os.path.exists(src):
         return [], None
-    # Never touch the live DB: copy sqlite+wal+shm to temp and read the
-    # copy read-only with a short timeout so a locked browser fails fast.
+    # Never touch the live DB: copy sqlite+wal+shm to a private temp dir
+    # and read the copy read-only with a short timeout.
     tmpdir = tempfile.mkdtemp(prefix="bookomarchy-zen-")
+    try:
+        os.chmod(tmpdir, 0o700)
+    except OSError:
+        pass
     tmp_db = os.path.join(tmpdir, "places.sqlite")
     try:
         for suffix in ("", "-wal", "-shm"):
             p = src + suffix
-            try:
-                if os.path.exists(p) and os.path.getsize(p) <= MAX_SQLITE_FILE:
-                    shutil.copy2(p, tmp_db + suffix)
-            except OSError as e:
-                print(f"zen copy failed ({e})", file=sys.stderr)
-                return [], None
+            if os.path.exists(p):
+                try:
+                    copy_nofollow_bounded(p, tmp_db + suffix, MAX_SQLITE_FILE)
+                except (OSError, RuntimeError) as e:
+                    print(f"zen copy failed ({e})", file=sys.stderr)
+                    return [], None
         try:
             con = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True, timeout=2)
         except Exception as e:
@@ -823,12 +933,12 @@ def cmd_recategorize(_args):
 
 
 def sh(*args, cwd=None):
-    return subprocess.run(args, cwd=cwd or DATA_DIR, capture_output=True,
+    return subprocess.run(args, cwd=cwd or STATE.path, capture_output=True,
                           text=True, timeout=30)
 
 
 def cmd_git_sync(_args):
-    if not os.path.isdir(os.path.join(DATA_DIR, ".git")):
+    if not os.path.isdir(os.path.join(STATE.path, ".git")):
         r = sh("git", "init")
         if r.returncode != 0:
             print(r.stderr.strip() or "git init failed", file=sys.stderr)
@@ -850,8 +960,18 @@ def cmd_git_sync(_args):
 
 
 def main(argv):
+    global STATE, ZEN_BASE
     scrub_env()
-    init_state()
+    home = os.path.expanduser("~")
+    if not home or home == "~":
+        print("cannot resolve home directory", file=sys.stderr)
+        return 1
+    try:
+        STATE = StateFS(home)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    ZEN_BASE = os.path.join(home, ".config", "zen")
     if len(argv) < 2:
         print("usage: backup|export-json|export-html|import|git-sync|zen-sync|recategorize|zen-source-mtime", file=sys.stderr)
         return 2

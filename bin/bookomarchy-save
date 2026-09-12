@@ -2,19 +2,23 @@
 """Atomic stdin -> bookmarks.json writer. No argv user data, no shell.
 
 Hardening (marketplace security baseline):
-- Fixed interpreter (/usr/bin/python3) + clean allowlist env (see Menu.qml,
-  which spawns helpers via `env -i`). Env is scrubbed again here.
+- Fixed interpreter (/usr/bin/python3) + clean allowlist env: spawned from
+  QML with clearEnvironment + `env -i`. Env scrubbed again here.
 - Hard wall-clock timeout via SIGALRM.
-- State dir verified symlink-free (nofollow), mode 0700, owned by our uid.
+- State dir opened once per component with O_DIRECTORY|O_NOFOLLOW and the
+  verified leaf fd is RETAINED: every read, exclusive temp creation, fsync
+  and renameat is dirfd-relative, so a path component swapped between
+  check and use cannot redirect IO (no TOCTOU). Unpredictable tmp names
+  protect the leaf; parent identity comes from the held fd.
+- Leaf dir mode 0700 + uid-owned (fstat, never path-resolved twice).
 - Bounded stdin / entry counts / field lengths / output size.
-- Unpredictable O_EXCL tmp file + fsync + atomic os.replace + dir fsync.
 """
 import json
 import os
+import secrets
 import signal
 import stat
 import sys
-import tempfile
 
 TIMEOUT_S = 15
 MAX_STDIN = 8 * 1024 * 1024
@@ -40,43 +44,94 @@ def on_timeout(_signum, _frame):
     os._exit(124)
 
 
-def secure_home():
-    home = os.path.expanduser("~")
-    if not home or home == "~" or not os.path.isdir(home):
-        raise RuntimeError("cannot resolve home directory")
-    return home
+def _leaf_ok(name):
+    return bool(name) and "/" not in name and name not in (".", "..") \
+        and not name.startswith(".") and len(name) <= 128
 
 
-def secure_state_dir(path):
-    """Create/verify private nofollow state dir. Rejects symlinked components."""
-    home = secure_home()
-    real_home = os.path.realpath(home)
-    if os.path.abspath(path) != os.path.abspath(
-            os.path.join(home, ".config", "omarchy", "bookomarchy")):
-        raise RuntimeError("unexpected state dir")
-    # Nofollow walk from home down: every component must exist as a real dir
-    # (or be created by us) and must not be a symlink.
-    rel = os.path.relpath(path, home)
-    cur = home
-    for part in rel.split(os.sep):
-        if part in ("", ".", ".."):
-            raise RuntimeError("bad path component")
-        cur = os.path.join(cur, part)
+class StateFS:
+    """Verified state dir held by fd; all IO dirfd-relative (no TOCTOU)."""
+
+    def __init__(self, home):
+        base = os.path.realpath(home)
+        if not base or not os.path.isdir(base):
+            raise RuntimeError("cannot resolve home directory")
+        fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            st = os.lstat(cur)
-            if stat.S_ISLNK(st.st_mode):
-                raise RuntimeError(f"refusing symlinked component: {cur}")
-            if not stat.S_ISDIR(st.st_mode):
-                raise RuntimeError(f"not a directory: {cur}")
+            for part in (".config", "omarchy", "bookomarchy"):
+                fd = self._child(fd, part, create=True, close_parent=True,
+                                 strict=False)
+            self._verify(fd, "state dir", strict=True)
+            self.fd = fd
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _verify(fd, what, strict):
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError(f"{what} is not a directory")
+        if st.st_uid != os.getuid():
+            raise RuntimeError(f"{what} not owned by current user")
+        if strict and stat.S_IMODE(st.st_mode) & 0o077:
+            os.fchmod(fd, 0o700)
+
+    def _child(self, parent_fd, name, create, close_parent, strict):
+        if not _leaf_ok(name) and name not in (".config", "omarchy", "bookomarchy"):
+            raise RuntimeError(f"bad name: {name}")
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         dir_fd=parent_fd)
         except FileNotFoundError:
-            os.mkdir(cur, 0o700)
-    os.chmod(path, 0o700)
-    st = os.stat(path)
-    if st.st_uid != os.getuid():
-        raise RuntimeError("state dir not owned by current user")
-    if os.path.realpath(path) != os.path.abspath(path):
-        raise RuntimeError("state dir resolves outside itself")
-    return path
+            if not create:
+                raise
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         dir_fd=parent_fd)
+        if close_parent:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+        self._verify(fd, name, strict)
+        return fd
+
+    def write_atomic(self, name, payload: bytes):
+        if not _leaf_ok(name):
+            raise RuntimeError(f"bad name: {name}")
+        if len(payload) > MAX_OUTPUT:
+            raise RuntimeError("output exceeds size limit")
+        for _ in range(5):
+            tmp = f".w-{secrets.token_hex(16)}.tmp"
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise RuntimeError("cannot allocate temp file")
+        try:
+            view = memoryview(payload)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.rename(tmp, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=self.fd)
+            except OSError:
+                pass
+            raise
+        os.fsync(self.fd)
 
 
 def read_stdin_bounded():
@@ -109,40 +164,16 @@ def check_entry(it):
                     raise RuntimeError(f"list entry too long: {field}")
 
 
-def atomic_write(dest, payload: bytes):
-    if len(payload) > MAX_OUTPUT:
-        raise RuntimeError("output exceeds size limit")
-    d = os.path.dirname(dest)
-    fd, tmp = tempfile.mkstemp(prefix=".bookmarks-", suffix=".tmp", dir=d)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, dest)
-        tmp = None
-    finally:
-        if tmp is not None:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-    dirfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(dirfd)
-    finally:
-        os.close(dirfd)
-
-
 def main() -> int:
     scrub_env()
     signal.signal(signal.SIGALRM, on_timeout)
     signal.alarm(TIMEOUT_S)
     try:
-        home = secure_home()
-        data_dir = secure_state_dir(
-            os.path.join(home, ".config", "omarchy", "bookomarchy"))
-        dest = os.path.join(data_dir, "bookmarks.json")
+        home = os.path.expanduser("~")
+        if not home or home == "~":
+            print("cannot resolve home directory", file=sys.stderr)
+            return 1
+        state = StateFS(home)
         raw = read_stdin_bounded()
         try:
             data = json.loads(raw)
@@ -164,7 +195,7 @@ def main() -> int:
                 return 1
         payload = (json.dumps(items, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         try:
-            atomic_write(dest, payload)
+            state.write_atomic("bookmarks.json", payload)
         except RuntimeError as e:
             print(str(e), file=sys.stderr)
             return 1

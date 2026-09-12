@@ -35,15 +35,15 @@ See `Menu.qml → isDangerousCommand()`.
 ## Process hardening (marketplace security baseline)
 
 Internal helpers (`bookomarchy-save`, `bookomarchy-maintenance`) are spawned
-from QML with a fixed interpreter and a wiped environment — no `bash`
+from QML with a cleared environment and a fixed interpreter — no `bash`
 anywhere in the plugin's own execution path:
 
-```
-["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/usr/bin/python3", <helper>, ...]
-```
-
-- `env -i` clears `BASH_ENV`, `PYTHONPATH`, `LD_PRELOAD`/`LD_LIBRARY_PATH`
-  and friends; the helpers scrub them again at startup as defense in depth.
+- QML `Process` sets `clearEnvironment: true` with an explicit allowlist
+  `environment: ({ "PATH": "/usr/bin:/bin" })`, so loader injection
+  (`LD_PRELOAD`, `BASH_ENV`, `PYTHONPATH`, …) is gone *before* the first
+  executable loads. The command vector keeps `env -i` plus the absolute
+  `/usr/bin/python3` as defense in depth, and the helpers scrub the env
+  again at startup.
   (`command`/`ssh` bookmarks still open in the user's terminal via
   `xdg-terminal-exec`, but only after the explicit ConfirmDialog above.)
 - Hard wall-clock timeout per action via `SIGALRM`
@@ -53,13 +53,15 @@ anywhere in the plugin's own execution path:
   length limits, output capped at 8 MiB; Zen reads capped
   (jsonlz4 file 64 MiB / decompressed 256 MiB / sqlite copy 256 MiB /
   100k rows / 200k bookmark nodes); import files capped at 8 MiB.
-- State dir (`~/.config/omarchy/bookomarchy/`) is verified on every run:
-  each path component `lstat`-checked (symlinks refused), mode `0700`,
-  owned by the current uid.
-- Writes use unpredictable `O_EXCL` tmp files + `fsync` + atomic
-  `os.replace` + directory `fsync`; backups use `O_EXCL|O_NOFOLLOW`.
-- Zen profile selection is constrained inside `~/.config/zen`; the live
-  `places.sqlite` is never opened — only a temp copy, read-only.
+- State dir (`~/.config/omarchy/bookomarchy/`) is opened once per
+  component with `O_DIRECTORY|O_NOFOLLOW` and the verified leaf fd is
+  **retained**: every bounded read, exclusive temp creation, fsync and
+  `renameat` is dirfd-relative, so a component swapped between check and
+  use cannot redirect IO (no TOCTOU). Leaf dirs are `0700` + uid-owned
+  (fstat). Unpredictable tmp names protect the leaf; parent identity comes
+  from the held fd. Writes use `O_EXCL` tmp + fsync + atomic rename +
+  directory fsync; backups `O_EXCL|O_NOFOLLOW`; Zen profiles constrained
+  to `~/.config/zen`.
 
 ## Dependencies
 
