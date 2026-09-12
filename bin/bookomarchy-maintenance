@@ -1,9 +1,18 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """bookomarchy-maintenance: backup / export / import / git-sync / zen-sync.
 
-All file paths stay inside ~/.config/omarchy/bookomarchy unless the user
+All state stays inside ~/.config/omarchy/bookomarchy unless the user
 passes an explicit import/export path. No network, no secrets.
 Zen sync only reads bookmark title/url/folder — never logins/cookies.
+
+Hardening (marketplace security baseline):
+- Fixed interpreter (/usr/bin/python3) + clean allowlist env (spawned via
+  `env -i` from Menu.qml). Env scrubbed again here as defense in depth.
+- Hard wall-clock timeout per action via SIGALRM.
+- State dir verified symlink-free (nofollow), mode 0700, owned by our uid.
+- Bounded reads (import/jsonlz4/sqlite/profile), entry counts, field and
+  output sizes. Unpredictable O_EXCL tmp files + fsync + atomic replace.
+- Zen profile paths constrained inside ~/.config/zen.
 """
 import configparser
 import csv
@@ -13,20 +22,159 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
-import struct
+import stat
 import subprocess
 import sys
 import tempfile
-import time
 from datetime import datetime
 
-HOME = os.path.expanduser("~")
-DATA_DIR = os.path.join(HOME, ".config", "omarchy", "bookomarchy")
-SRC = os.path.join(DATA_DIR, "bookmarks.json")
-SETTINGS = os.path.join(DATA_DIR, "settings.json")
-BACKUP_DIR = os.path.join(DATA_DIR, "backups")
-ZEN_BASE = os.path.join(HOME, ".config", "zen")
+TIMEOUTS = {"zen-sync": 90, "import": 60}
+DEFAULT_TIMEOUT = 30
+
+MAX_ITEMS = 20000
+MAX_OUTPUT = 8 * 1024 * 1024
+MAX_IMPORT_FILE = 8 * 1024 * 1024
+MAX_JSONLZ4_FILE = 64 * 1024 * 1024
+MAX_LZ4_OUTPUT = 256 * 1024 * 1024
+MAX_SQLITE_FILE = 256 * 1024 * 1024
+MAX_SQLITE_ROWS = 100000
+MAX_FF_NODES = 200000
+FIELD_LIMITS = {"id": 128, "title": 512, "target": 2048, "type": 32,
+                "category": 128, "description": 2048}
+
+SCRUB_ENV = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "PYTHONPATH",
+             "PYTHONHOME", "PYTHONSTARTUP", "BASH_ENV", "ENV", "ZDOTDIR",
+             "PERL5LIB", "RUBYLIB", "NODE_PATH")
+
+DATA_DIR = None
+SRC = None
+SETTINGS = None
+BACKUP_DIR = None
+ZEN_BASE = None
+
+BLOCKED_CMD = re.compile(r"(sudo\s|rm\s+-rf|chmod|chown|curl\s.*\|\s*sh|wget\s.*\|\s*sh|mkfs|dd\s+of=)", re.I)
+SKIP_SCHEMES = ("place:", "about:", "data:", "chrome:", "resource:",
+                "wyciwyg:", "moz-", "view-source:")
+
+
+def scrub_env():
+    for k in SCRUB_ENV:
+        os.environ.pop(k, None)
+
+
+def on_timeout(_signum, _frame):
+    print("timed out", file=sys.stderr)
+    os._exit(124)
+
+
+def secure_home():
+    home = os.path.expanduser("~")
+    if not home or home == "~" or not os.path.isdir(home):
+        raise RuntimeError("cannot resolve home directory")
+    return home
+
+
+def secure_state_dir(path, home):
+    """Create/verify private nofollow state dir. Rejects symlinked components."""
+    if os.path.abspath(path) != os.path.abspath(
+            os.path.join(home, ".config", "omarchy", "bookomarchy")):
+        raise RuntimeError("unexpected state dir")
+    rel = os.path.relpath(path, home)
+    cur = home
+    for part in rel.split(os.sep):
+        if part in ("", ".", ".."):
+            raise RuntimeError("bad path component")
+        cur = os.path.join(cur, part)
+        try:
+            st = os.lstat(cur)
+            if stat.S_ISLNK(st.st_mode):
+                raise RuntimeError(f"refusing symlinked component: {cur}")
+            if not stat.S_ISDIR(st.st_mode):
+                raise RuntimeError(f"not a directory: {cur}")
+        except FileNotFoundError:
+            os.mkdir(cur, 0o700)
+    os.chmod(path, 0o700)
+    st = os.stat(path)
+    if st.st_uid != os.getuid():
+        raise RuntimeError("state dir not owned by current user")
+    if os.path.realpath(path) != os.path.abspath(path):
+        raise RuntimeError("state dir resolves outside itself")
+    return path
+
+
+def init_state():
+    global DATA_DIR, SRC, SETTINGS, BACKUP_DIR, ZEN_BASE
+    home = secure_home()
+    DATA_DIR = secure_state_dir(
+        os.path.join(home, ".config", "omarchy", "bookomarchy"), home)
+    SRC = os.path.join(DATA_DIR, "bookmarks.json")
+    SETTINGS = os.path.join(DATA_DIR, "settings.json")
+    BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+    ZEN_BASE = os.path.join(home, ".config", "zen")
+
+
+def atomic_write_bytes(dest, payload: bytes):
+    """Exclusive unpredictable tmp + fsync + atomic replace + dir fsync."""
+    if len(payload) > MAX_OUTPUT:
+        raise RuntimeError("output exceeds size limit")
+    d = os.path.dirname(os.path.abspath(dest))
+    if os.path.realpath(d) != os.path.abspath(d):
+        raise RuntimeError("refusing symlinked destination dir")
+    fd, tmp = tempfile.mkstemp(prefix=".bookomarchy-", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dest)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    dirfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+
+
+def atomic_write_json(dest, obj):
+    payload = (json.dumps(obj, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    atomic_write_bytes(dest, payload)
+
+
+def read_file_bounded(path, limit):
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(f"not a regular file: {path}")
+    if st.st_size > limit:
+        raise RuntimeError(f"file exceeds size limit: {path}")
+    with open(path, "rb") as f:
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise RuntimeError(f"file exceeds size limit: {path}")
+    return data
+
+
+def check_entry(it):
+    if not isinstance(it, dict):
+        raise RuntimeError("each bookmark must be an object")
+    for k in ("id", "title", "target"):
+        if not str(it.get(k, "")).strip():
+            raise RuntimeError(f"missing required field: {k}")
+    for banned in ("password", "token", "private_key", "secret"):
+        if banned in it:
+            raise RuntimeError(f"refused field: {banned}")
+    for field, limit in FIELD_LIMITS.items():
+        v = it.get(field)
+        if v is not None and len(str(v)) > limit:
+            raise RuntimeError(f"field too long: {field}")
+
 
 # (pattern, category): first match wins. Applied to title+url on zen-sync
 # import AND by the `recategorize` command for existing items.
@@ -52,11 +200,11 @@ def zen_excluded(title, url):
     try:
         zcfg = load_settings().get("zenSync") or {}
         for p in zcfg.get("exclude") or []:
-            if isinstance(p, str) and p.strip():
+            if isinstance(p, str) and p.strip() and len(p) <= 256:
                 patterns.append(p)
     except Exception:
         pass
-    hay = f"{title} {url}"
+    hay = f"{title} {url}"[:4096]
     for pattern in patterns:
         try:
             if re.search(pattern, hay, re.I):
@@ -70,18 +218,18 @@ def category_rules():
     extra = []
     try:
         zcfg = load_settings().get("zenSync") or {}
-        for r in zcfg.get("categoryRules") or []:
+        for r in (zcfg.get("categoryRules") or [])[:32]:
             if isinstance(r, (list, tuple)) and len(r) == 2:
-                extra.append((r[0], r[1]))
+                extra.append((str(r[0])[:256], r[1]))
             elif isinstance(r, dict) and r.get("match"):
-                extra.append((r["match"], r.get("category")))
+                extra.append((str(r["match"])[:256], r.get("category")))
     except Exception:
         pass
     return extra + DEFAULT_CATEGORY_RULES
 
 
 def rule_category(title, url, fallback):
-    hay = f"{title} {url}".lower()
+    hay = f"{title} {url}".lower()[:4096]
     for pattern, cat in category_rules():
         if not cat:
             continue
@@ -92,45 +240,39 @@ def rule_category(title, url, fallback):
             continue
     return fallback
 
-BLOCKED_CMD = re.compile(r"(sudo\s|rm\s+-rf|chmod|chown|curl\s.*\|\s*sh|wget\s.*\|\s*sh|mkfs|dd\s+of=)", re.I)
-SKIP_SCHEMES = ("place:", "about:", "data:", "chrome:", "resource:",
-                "wyciwyg:", "moz-", "view-source:")
-
 
 def load():
     if not os.path.exists(SRC):
         return []
-    with open(SRC, encoding="utf-8") as f:
-        data = json.load(f)
-    return data if isinstance(data, list) else data.get("bookmarks", [])
+    raw = read_file_bounded(SRC, MAX_OUTPUT)
+    data = json.loads(raw.decode("utf-8"))
+    items = data if isinstance(data, list) else data.get("bookmarks", [])
+    if not isinstance(items, list) or len(items) > MAX_ITEMS:
+        raise RuntimeError("bookmarks file invalid or too large")
+    return items
 
 
 def save(items):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = SRC + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, SRC)
+    if len(items) > MAX_ITEMS:
+        raise RuntimeError("too many bookmarks")
+    for it in items:
+        check_entry(it)
+    atomic_write_json(SRC, items)
 
 
 def load_settings():
     if not os.path.exists(SETTINGS):
         return {}
     try:
-        with open(SETTINGS, encoding="utf-8") as f:
-            return json.load(f)
+        raw = read_file_bounded(SETTINGS, 1024 * 1024)
+        s = json.loads(raw.decode("utf-8"))
+        return s if isinstance(s, dict) else {}
     except Exception:
         return {}
 
 
 def save_settings(s):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = SETTINGS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(s, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, SETTINGS)
+    atomic_write_json(SETTINGS, s)
 
 
 def normalize_url(t):
@@ -157,51 +299,90 @@ def normalize_url(t):
 
 def slugify(title, existing_ids):
     base = re.sub(r"[^a-z0-9]+", "-", str(title or "bookmark").lower()).strip("-") or "bookmark"
-    bid, n = base, 2
+    bid, n = base[:64], 2
     while bid in existing_ids:
         bid = f"{base}-{n}"
         n += 1
+        if n > 100000:
+            raise RuntimeError("cannot allocate bookmark id")
     return bid
 
 
-def cmd_backup(_args):
+def backup_dest():
     os.makedirs(BACKUP_DIR, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
     dest = os.path.join(BACKUP_DIR, f"bookomarchy-backup-{stamp}.json")
-    shutil.copy2(SRC, dest)
+    if os.path.exists(dest):
+        dest = os.path.join(BACKUP_DIR, f"bookomarchy-backup-{stamp}-{os.getpid()}.json")
+    return dest
+
+
+def cmd_backup(_args):
+    dest = backup_dest()
+    data = read_file_bounded(SRC, MAX_OUTPUT)
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise
+    print(dest)
+
+
+def bounded_copy(src, dest, limit):
+    data = read_file_bounded(src, limit)
+    if os.path.dirname(os.path.abspath(dest)) == DATA_DIR:
+        atomic_write_bytes(dest, data)
+    else:  # explicit user target outside state dir
+        with open(dest, "wb") as f:
+            f.write(data)
     print(dest)
 
 
 def cmd_export_json(args):
     dest = args[0] if args else os.path.join(DATA_DIR, "bookmarks-export.json")
     dest = os.path.expanduser(dest)
-    shutil.copy2(SRC, dest)
-    print(dest)
+    bounded_copy(SRC, dest, MAX_OUTPUT)
 
 
 def cmd_export_html(args):
     dest = args[0] if args else os.path.join(DATA_DIR, "bookmarks.html")
     dest = os.path.expanduser(dest)
     items = load()
-    with open(dest, "w", encoding="utf-8") as f:
-        f.write("<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n<TITLE>BookOmarchy</TITLE>\n<H1>BookOmarchy</H1>\n<DL><p>\n")
-        for it in items:
-            url = htmlmod.escape(str(it.get("target", "")), quote=True)
-            title = htmlmod.escape(str(it.get("title", "")))
-            f.write(f'    <DT><A HREF="{url}">{title}</A>\n')
-        f.write("</DL><p>\n")
+    parts = ["<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n<TITLE>BookOmarchy</TITLE>\n<H1>BookOmarchy</H1>\n<DL><p>\n"]
+    for it in items:
+        url = htmlmod.escape(str(it.get("target", ""))[:2048], quote=True)
+        title = htmlmod.escape(str(it.get("title", ""))[:512])
+        parts.append(f'    <DT><A HREF="{url}">{title}</A>\n')
+        if len("".join(parts)) > MAX_OUTPUT:
+            raise RuntimeError("export exceeds size limit")
+    parts.append("</DL><p>\n")
+    payload = "".join(parts).encode("utf-8")
+    if os.path.dirname(os.path.abspath(dest)) == DATA_DIR:
+        atomic_write_bytes(dest, payload)
+    else:
+        with open(dest, "wb") as f:
+            f.write(payload)
     print(dest)
 
 
 def parse_html(text):
     out = []
-    for m in re.finditer(r'<A\s[^>]*HREF="([^"]+)"[^>]*>([^<]+)</A>', text, re.I):
+    for m in re.finditer(r'<A\s[^>]*HREF="([^"]{1,2048})"[^>]*>([^<]{1,512})</A>', text, re.I):
         url, title = m.group(1).strip(), m.group(2).strip()
         if not url or not title:
             continue
-        bid = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or f"import-{len(out)}"
+        bid = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:64] or f"import-{len(out)}"
         out.append({"id": bid, "title": title, "type": "url", "target": url,
                     "category": "Imported", "aliases": [], "tags": [], "description": ""})
+        if len(out) >= MAX_ITEMS:
+            break
     return out
 
 
@@ -210,25 +391,33 @@ def cmd_import(args):
         print("usage: import <path.json|path.html|path.csv>", file=sys.stderr)
         return 1
     path = os.path.expanduser(args[0])
-    with open(path, encoding="utf-8", errors="replace") as f:
-        raw = f.read()
+    raw = read_file_bounded(path, MAX_IMPORT_FILE).decode("utf-8", errors="replace")
     items = []
     if path.endswith(".html"):
         items = parse_html(raw)
     elif path.endswith(".csv"):
         for row in csv.DictReader(raw.splitlines()):
-            title = (row.get("title") or "").strip()
-            target = (row.get("target") or row.get("url") or "").strip()
+            title = (row.get("title") or "").strip()[:512]
+            target = (row.get("target") or row.get("url") or "").strip()[:2048]
             if not title or not target:
                 continue
-            bid = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+            bid = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:64]
             items.append({"id": bid or f"import-{len(items)}", "title": title, "type": "url",
-                          "target": target, "category": (row.get("category") or "Imported").strip() or "Imported",
+                          "target": target, "category": (row.get("category") or "Imported").strip()[:128] or "Imported",
                           "aliases": [], "tags": [], "description": ""})
+            if len(items) >= MAX_ITEMS:
+                break
     else:
         data = json.loads(raw)
-        items = data if isinstance(data, list) else data.get("bookmarks", [])
+        raw_items = data if isinstance(data, list) else data.get("bookmarks", [])
+        if not isinstance(raw_items, list) or len(raw_items) > MAX_ITEMS:
+            print("import file invalid or too large", file=sys.stderr)
+            return 1
+        items = raw_items
     existing = load()
+    if len(existing) + len(items) > MAX_ITEMS:
+        print("import would exceed bookmark limit", file=sys.stderr)
+        return 1
     seen = {str(x.get("id")) for x in existing}
     added = 0
     for it in items:
@@ -241,6 +430,10 @@ def cmd_import(args):
         it.setdefault("aliases", [])
         it.setdefault("tags", [])
         it.setdefault("description", "")
+        try:
+            check_entry(it)
+        except RuntimeError:
+            continue
         existing.append(it)
         seen.add(str(it["id"]))
         added += 1
@@ -258,7 +451,8 @@ def zen_profiles():
     if os.path.exists(ini):
         cp = configparser.ConfigParser()
         try:
-            cp.read(ini, encoding="utf-8")
+            for chunk in [read_file_bounded(ini, 1024 * 1024).decode("utf-8", errors="replace")]:
+                cp.read_string(chunk)
             for sec in cp.sections():
                 if sec.lower().startswith("profile"):
                     path = (cp[sec].get("Path") or "").strip()
@@ -276,6 +470,13 @@ def zen_profiles():
     return out
 
 
+def inside_zen_base(path):
+    try:
+        return os.path.realpath(path).startswith(os.path.realpath(ZEN_BASE) + os.sep)
+    except Exception:
+        return False
+
+
 def pick_zen_profile(want):
     profiles = zen_profiles()
     if not profiles:
@@ -285,9 +486,10 @@ def pick_zen_profile(want):
         for name, path in profiles:
             if want in name.lower() or want in os.path.basename(path).lower():
                 return name, path
-        # treat as direct path
-        if os.path.isdir(os.path.expanduser(want)):
-            return os.path.basename(want), os.path.expanduser(want)
+        # treat as direct path, constrained inside the zen base dir
+        direct = os.path.expanduser(want)
+        if os.path.isdir(direct) and inside_zen_base(direct):
+            return os.path.basename(direct), direct
     # prefer profile with biggest places.sqlite
     best, best_sz = profiles[0], -1
     for item in profiles:
@@ -301,7 +503,7 @@ def pick_zen_profile(want):
     return best
 
 
-def lz4_block_decompress(raw):
+def lz4_block_decompress(raw, max_out=MAX_LZ4_OUTPUT):
     """Pure-python LZ4 block decompressor (no frame). Raises on corrupt data."""
     n = len(raw)
     pos = 0
@@ -325,6 +527,8 @@ def lz4_block_decompress(raw):
                     break
         if pos + lit_len > n:
             raise ValueError("truncated literals")
+        if len(out) + lit_len > max_out:
+            raise ValueError("decompressed output exceeds limit")
         out.extend(raw[pos:pos + lit_len])
         pos += lit_len
         if pos >= n:
@@ -346,6 +550,8 @@ def lz4_block_decompress(raw):
                 if b != 255:
                     break
         match_len += 4
+        if len(out) + match_len > max_out:
+            raise ValueError("decompressed output exceeds limit")
         start = len(out) - offset
         for _ in range(match_len):
             out.append(out[start])
@@ -354,8 +560,7 @@ def lz4_block_decompress(raw):
 
 
 def read_jsonlz4(path):
-    with open(path, "rb") as f:
-        data = f.read()
+    data = read_file_bounded(path, MAX_JSONLZ4_FILE)
     if data[:8] != b"mozLz40\0":
         raise ValueError("not mozlz4")
     body = data[8:]
@@ -369,7 +574,10 @@ def read_jsonlz4(path):
         last_err = None
         for c in candidates:
             try:
-                return json.loads(lz4b.decompress(c).decode("utf-8"))
+                raw = lz4b.decompress(c)
+                if len(raw) > MAX_LZ4_OUTPUT:
+                    raise ValueError("decompressed output exceeds limit")
+                return json.loads(raw.decode("utf-8"))
             except Exception as e:
                 last_err = e
         raise last_err
@@ -383,39 +591,42 @@ def read_jsonlz4(path):
         raise last_err
 
 
-def walk_ff_bookmarks(node, folder, out):
+def walk_ff_bookmarks(node, folder, out, counter):
     """Recursively collect (title, url, folder) from Firefox bookmark JSON."""
+    counter[0] += 1
+    if counter[0] > MAX_FF_NODES:
+        raise ValueError("bookmark tree exceeds node limit")
     if isinstance(node, list):
         for c in node:
-            walk_ff_bookmarks(c, folder, out)
+            walk_ff_bookmarks(c, folder, out, counter)
         return
     if not isinstance(node, dict):
         return
     ntype = node.get("type") or node.get("typeCode")
     if ntype in ("text/x-moz-place-container", 2):
-        title = str(node.get("title") or "").strip()
-        # skip root pseudo-folders, keep real ones
+        title = str(node.get("title") or "").strip()[:128]
         next_folder = folder
         if title and node.get("root") not in ("placesRoot",):
-            # toolbar/menu/other are real folders but noisy; keep them
-            next_folder = title if folder in ("", "root") else folder + " / " + title
+            next_folder = title if folder in ("", "root") else (folder + " / " + title)[:256]
         for c in node.get("children", []) or []:
-            walk_ff_bookmarks(c, next_folder, out)
+            walk_ff_bookmarks(c, next_folder, out, counter)
     elif ntype in ("text/x-moz-place", 1):
         url = str(node.get("uri") or "").strip()
-        title = str(node.get("title") or "").strip() or url
-        if not url or url.startswith(SKIP_SCHEMES):
+        title = (str(node.get("title") or "").strip() or url)[:512]
+        if not url or len(url) > 2048 or url.startswith(SKIP_SCHEMES):
             return
         out.append((title, url, folder or "Zen"))
+        if len(out) >= MAX_SQLITE_ROWS:
+            raise ValueError("bookmark count exceeds limit")
     else:
         for c in node.get("children", []) or []:
-            walk_ff_bookmarks(c, folder, out)
+            walk_ff_bookmarks(c, folder, out, counter)
 
 
 def zen_from_backup(profile_path):
     bdir = os.path.join(profile_path, "bookmarkbackups")
     cands = sorted(glob.glob(os.path.join(bdir, "*.jsonlz4")),
-                   key=lambda p: os.path.getmtime(p), reverse=True)
+                   key=lambda p: os.path.getmtime(p), reverse=True)[:8]
     if not cands:
         return [], None
     latest = cands[0]
@@ -425,14 +636,21 @@ def zen_from_backup(profile_path):
         print(f"zen backup unreadable ({e}), trying places.sqlite", file=sys.stderr)
         return [], None
     out = []
-    # doc may be root node or {"children": [...]}
-    walk_ff_bookmarks(doc, "", out)
+    try:
+        walk_ff_bookmarks(doc, "", out, [0])
+    except Exception as e:
+        print(f"zen backup walk failed ({e})", file=sys.stderr)
+        return [], None
     return out, latest
 
 
 def zen_from_sqlite(profile_path):
     src = os.path.join(profile_path, "places.sqlite")
-    if not os.path.exists(src):
+    try:
+        if os.path.getsize(src) > MAX_SQLITE_FILE:
+            print("zen places.sqlite exceeds size limit", file=sys.stderr)
+            return [], None
+    except OSError:
         return [], None
     # Never touch the live DB: copy sqlite+wal+shm to temp and read the
     # copy read-only with a short timeout so a locked browser fails fast.
@@ -441,12 +659,12 @@ def zen_from_sqlite(profile_path):
     try:
         for suffix in ("", "-wal", "-shm"):
             p = src + suffix
-            if os.path.exists(p):
-                try:
+            try:
+                if os.path.exists(p) and os.path.getsize(p) <= MAX_SQLITE_FILE:
                     shutil.copy2(p, tmp_db + suffix)
-                except OSError as e:
-                    print(f"zen copy failed ({e})", file=sys.stderr)
-                    return [], None
+            except OSError as e:
+                print(f"zen copy failed ({e})", file=sys.stderr)
+                return [], None
         try:
             con = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True, timeout=2)
         except Exception as e:
@@ -458,10 +676,15 @@ def zen_from_sqlite(profile_path):
                 "SELECT b.title, p.url, COALESCE(f.title,'') "
                 "FROM moz_bookmarks b JOIN moz_places p ON b.fk = p.id "
                 "LEFT JOIN moz_bookmarks f ON b.parent = f.id "
-                "WHERE b.type = 1 AND p.url NOT LIKE 'place:%'")
-            rows = [(str(t or u).strip() or u.strip(), u.strip(), str(fl or "").strip() or "Zen")
-                    for (t, u, fl) in cur.fetchall()
-                    if u and u.strip() and not u.startswith(SKIP_SCHEMES)]
+                "WHERE b.type = 1 AND p.url NOT LIKE 'place:%' "
+                f"LIMIT {MAX_SQLITE_ROWS}")
+            rows = []
+            for (t, u, fl) in cur.fetchall():
+                u = (u or "").strip()
+                if not u or len(u) > 2048 or u.startswith(SKIP_SCHEMES):
+                    continue
+                rows.append(((str(t or u).strip() or u)[:512], u,
+                             str(fl or "").strip()[:128] or "Zen"))
             return rows, src
         except Exception as e:
             print(f"zen places.sqlite query failed ({e})", file=sys.stderr)
@@ -486,14 +709,14 @@ def cmd_zen_sync(args):
         if a == "--dry-run":
             dry_run = True
         elif a.startswith("--profile="):
-            want_profile = a.split("=", 1)[1]
+            want_profile = a.split("=", 1)[1][:128]
         elif a.startswith("--category="):
-            category_override = a.split("=", 1)[1]
+            category_override = a.split("=", 1)[1][:128]
         elif a.startswith("--"):
             print(f"unknown flag: {a}", file=sys.stderr)
             return 2
         elif want_profile is None:
-            want_profile = a
+            want_profile = a[:128]
     name, path = pick_zen_profile(want_profile)
     if not path:
         print("zen profile not found (~/.config/zen)", file=sys.stderr)
@@ -511,7 +734,7 @@ def cmd_zen_sync(args):
     # prefer live sqlite titles when the same URL exists in both
     for title, url, folder in s_items:
         key = normalize_url(url).lower()
-        if key in merged:
+        if key in merged and not zen_excluded(title, url):
             merged[key] = (title, url, folder)
     items = list(merged.values())
     source = s_src or b_src
@@ -537,10 +760,13 @@ def cmd_zen_sync(args):
         ids.add(bid)
         cat = default_cat if folder in ("", "root") else folder
         cat = rule_category(title, norm, cat)
-        fresh.append({"id": bid, "title": title, "type": "url", "target": norm,
-                      "category": cat, "aliases": [], "tags": ["zen"],
-                      "description": f"Zen import ({name})"})
+        fresh.append({"id": bid, "title": title[:512], "type": "url", "target": norm[:2048],
+                      "category": cat[:128], "aliases": [], "tags": ["zen"],
+                      "description": f"Zen import ({name})"[:256]})
         seen_url[norm.lower()] = fresh[-1]
+        if len(existing) + len(fresh) > MAX_ITEMS:
+            print("sync would exceed bookmark limit", file=sys.stderr)
+            return 1
     if dry_run:
         print(f"zen-sync dry-run [{name}]: {len(fresh)} new, {len(items)} in zen, {len(existing)} in bookomarchy")
         return 0
@@ -550,7 +776,7 @@ def cmd_zen_sync(args):
     settings.setdefault("zenSync", {})
     if isinstance(settings["zenSync"], dict):
         settings["zenSync"]["lastSync"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        settings["zenSync"]["lastSource"] = source or ""
+        settings["zenSync"]["lastSource"] = (source or "")[:512]
         settings["zenSync"]["lastAdded"] = len(fresh)
         save_settings(settings)
     print(f"zen-sync [{name}]: imported {len(fresh)} of {len(items)}")
@@ -597,7 +823,8 @@ def cmd_recategorize(_args):
 
 
 def sh(*args, cwd=None):
-    return subprocess.run(args, cwd=cwd or DATA_DIR, capture_output=True, text=True)
+    return subprocess.run(args, cwd=cwd or DATA_DIR, capture_output=True,
+                          text=True, timeout=30)
 
 
 def cmd_git_sync(_args):
@@ -623,32 +850,38 @@ def cmd_git_sync(_args):
 
 
 def main(argv):
-    os.makedirs(DATA_DIR, exist_ok=True)
+    scrub_env()
+    init_state()
     if len(argv) < 2:
         print("usage: backup|export-json|export-html|import|git-sync|zen-sync|recategorize|zen-source-mtime", file=sys.stderr)
         return 2
     action, rest = argv[1], argv[2:]
-    if action == "backup":
-        cmd_backup(rest)
-    elif action == "export-json":
-        cmd_export_json(rest)
-    elif action == "export-html":
-        cmd_export_html(rest)
-    elif action == "import":
-        return cmd_import(rest)
-    elif action == "git-sync":
-        return cmd_git_sync(rest)
-    elif action == "zen-sync":
-        return cmd_zen_sync(rest)
-    elif action == "recategorize":
-        return cmd_recategorize(rest)
-    elif action == "zen-source-mtime":
-        m = zen_source_mtime()
-        print(int(m) if m else 0)
-    else:
-        print(f"unknown action: {action}", file=sys.stderr)
-        return 2
-    return 0
+    signal.signal(signal.SIGALRM, on_timeout)
+    signal.alarm(TIMEOUTS.get(action, DEFAULT_TIMEOUT))
+    try:
+        if action == "backup":
+            cmd_backup(rest)
+        elif action == "export-json":
+            cmd_export_json(rest)
+        elif action == "export-html":
+            cmd_export_html(rest)
+        elif action == "import":
+            return cmd_import(rest)
+        elif action == "git-sync":
+            return cmd_git_sync(rest)
+        elif action == "zen-sync":
+            return cmd_zen_sync(rest)
+        elif action == "recategorize":
+            return cmd_recategorize(rest)
+        elif action == "zen-source-mtime":
+            m = zen_source_mtime()
+            print(int(m) if m else 0)
+        else:
+            print(f"unknown action: {action}", file=sys.stderr)
+            return 2
+        return 0
+    finally:
+        signal.alarm(0)
 
 
 if __name__ == "__main__":

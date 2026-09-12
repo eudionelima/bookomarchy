@@ -32,10 +32,40 @@ See `Menu.qml → isDangerousCommand()`.
   `bash -c` string interpolation of user data.
 - No `eval`, no dynamic QML loading, no network fetch, no telemetry.
 
+## Process hardening (marketplace security baseline)
+
+Internal helpers (`bookomarchy-save`, `bookomarchy-maintenance`) are spawned
+from QML with a fixed interpreter and a wiped environment — no `bash`
+anywhere in the plugin's own execution path:
+
+```
+["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/usr/bin/python3", <helper>, ...]
+```
+
+- `env -i` clears `BASH_ENV`, `PYTHONPATH`, `LD_PRELOAD`/`LD_LIBRARY_PATH`
+  and friends; the helpers scrub them again at startup as defense in depth.
+  (`command`/`ssh` bookmarks still open in the user's terminal via
+  `xdg-terminal-exec`, but only after the explicit ConfirmDialog above.)
+- Hard wall-clock timeout per action via `SIGALRM`
+  (save 15s, maintenance 30s, `import` 60s, `zen-sync` 90s);
+  `git` subprocess calls additionally carry a 30s timeout.
+- Bounded I/O: stdin capped at 8 MiB, max 20000 bookmarks, per-field
+  length limits, output capped at 8 MiB; Zen reads capped
+  (jsonlz4 file 64 MiB / decompressed 256 MiB / sqlite copy 256 MiB /
+  100k rows / 200k bookmark nodes); import files capped at 8 MiB.
+- State dir (`~/.config/omarchy/bookomarchy/`) is verified on every run:
+  each path component `lstat`-checked (symlinks refused), mode `0700`,
+  owned by the current uid.
+- Writes use unpredictable `O_EXCL` tmp files + `fsync` + atomic
+  `os.replace` + directory `fsync`; backups use `O_EXCL|O_NOFOLLOW`.
+- Zen profile selection is constrained inside `~/.config/zen`; the live
+  `places.sqlite` is never opened — only a temp copy, read-only.
+
 ## Dependencies
 
-- Runtime: `xdg-open`, `xdg-terminal-exec`, `python3`, `git` (optional, sync only)
-- No npm/pip packages. Helpers are stdlib-only Python 3 + bash.
+- Runtime: `xdg-open`, `xdg-terminal-exec`, `/usr/bin/python3` (stdlib only),
+  `git` (optional, sync only), `/usr/bin/env` (clean-env spawn)
+- No npm/pip packages. Helpers are stdlib-only Python 3. No bash.
 
 ## Reporting
 

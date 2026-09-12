@@ -18,6 +18,10 @@ Item {
   readonly property string settingsPath: dataDir + "/settings.json"
   readonly property string saveHelper: home + "/.config/omarchy/plugins/eudionelima.bookomarchy/bin/bookomarchy-save"
   readonly property string maintHelper: home + "/.config/omarchy/plugins/eudionelima.bookomarchy/bin/bookomarchy-maintenance"
+  // Fixed trusted interpreter + clean allowlist env for internal helpers.
+  // No bash, nothing resolved via PATH: env -i wipes BASH_ENV, PYTHONPATH,
+  // LD_* and friends before /usr/bin/python3 starts.
+  readonly property var pyRun: ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/usr/bin/python3"]
   readonly property var appLibrary: shell ? shell.appLibrary : null
 
   // mode: browse | add | edit | manage
@@ -380,7 +384,7 @@ Item {
 
   function runMaintenance(action, arg) {
     ioProc.actionLabel = action;
-    var cmd = ["python3", root.maintHelper, action];
+    var cmd = root.pyRun.concat([root.maintHelper, action]);
     if (arg) cmd.push(arg);
     ioProc.command = cmd;
     ioProc.running = true;
@@ -456,18 +460,14 @@ Item {
 
   ListModel { id: displayModel }
 
-  Process {
-    id: ensureDirProc
-    command: ["bash", "-lc", "mkdir -p ~/.config/omarchy/bookomarchy/backups"]
-  }
-
   // Atomic save via stdin — no user data in argv, no shell quoting.
+  // (ensure-dir is handled inside the helper itself; no bash here.)
   Process {
     id: saveProc
     stdinEnabled: true
     property string payload: ""
     property string pendingMsg: "Saved"
-    command: ["python3", root.saveHelper]
+    command: root.pyRun.concat([root.saveHelper])
     onStarted: { write(payload + "\n"); }
     stdout: StdioCollector {
       waitForEnd: true
@@ -540,7 +540,6 @@ Item {
   }
 
   Component.onCompleted: {
-    ensureDirProc.running = true;
     root.bookmarks = root.seedBookmarks();
     root.rebuildCategories();
     root.rebuildDisplay();

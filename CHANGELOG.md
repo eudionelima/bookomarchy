@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.2 — 2026-09-12
+
+- Security baseline hardening (maintainer review): no `bash` left in the
+  plugin's own execution path; helpers spawn via
+  `env -i PATH=/usr/bin:/bin /usr/bin/python3` (wipes `BASH_ENV`,
+  `PYTHONPATH`, `LD_*`), plus in-script env scrub.
+- Hard timeouts (`SIGALRM`: save 15s, maintenance 30s, import 60s,
+  zen-sync 90s; git subprocess 30s) and bounded I/O (stdin 8 MiB,
+  20000 bookmarks, field/output caps, jsonlz4/sqlite/import caps).
+- State dir verified nofollow + `0700` + uid-owned on every run;
+  unpredictable `O_EXCL` tmp + fsync + atomic replace (+ dir fsync);
+  backups `O_EXCL|O_NOFOLLOW`; Zen profiles constrained to `~/.config/zen`.
+
 ## 1.2.1 — 2026-09-12
 
 - Docs: README restructured (What it does, Screenshots, Features,
