@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 — 2026-09-12
+
+- Bar icon: new `bar-widget` kind (`BarWidget.qml`, bookmark glyph).
+  Left-click toggles the menu, right-click opens manage mode.
+  Inherits bar foreground/font via `WidgetButton` — follows the theme like any native widget.
+  Enable placement: `omarchy plugin enable eudionelima.bookomarchy --section right`
+  (or any `left/center/right` entry in `shell.json`).
+
 ## 1.0.0 — 2026-09-12
 
 F0–F5 complete:

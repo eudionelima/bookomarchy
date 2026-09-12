@@ -2,7 +2,7 @@
 
 Fast keyboard-first bookmarks and shortcuts for Omarchy.
 
-ID: `eudionelima.bookomarchy` · kind `menu` · `SUPER+B`
+ID: `eudionelima.bookomarchy` · kinds `menu` + `bar-widget` · `SUPER+B`
 
 ## Features
 
@@ -41,6 +41,15 @@ Hyprland:
 ```ini
 bind = SUPER, B, exec, omarchy-shell shell toggle eudionelima.bookomarchy '{}'
 bind = SUPER SHIFT, B, exec, omarchy-shell shell summon eudionelima.bookomarchy '{"mode":"manage"}'
+```
+
+## Bar icon
+
+Left-click the bookmark icon toggles the menu, right-click opens manage mode.
+The icon uses the bar's own foreground/font, so it follows every theme.
+
+```bash
+omarchy plugin enable eudionelima.bookomarchy --section right
 ```
 
 ## Data (never inside the plugin repo)
