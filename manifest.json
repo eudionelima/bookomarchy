@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "eudionelima.bookomarchy",
   "name": "BookOmarchy",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "Dione Lima",
   "license": "MIT",
   "description": "Fast keyboard-first bookmark and shortcut manager for Omarchy.",

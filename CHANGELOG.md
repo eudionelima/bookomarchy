@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.1 — 2026-09-12
+
+- Docs: README restructured (What it does, Screenshots, Features,
+  Requirements, Install, Uninstall, Usage, Note, License).
+
 ## 1.2.0 — 2026-09-12
 
 - Zen Browser sync: new `zen-sync` in `bin/bookomarchy-maintenance`
