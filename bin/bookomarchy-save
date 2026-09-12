@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Atomic stdin -> bookmarks.json writer. No argv user data, no shell."""
+import json
+import os
+import sys
+
+HOME = os.path.expanduser("~")
+DATA_DIR = os.path.join(HOME, ".config", "omarchy", "bookomarchy")
+DEST = os.path.join(DATA_DIR, "bookmarks.json")
+
+REQUIRED = ("id", "title", "target")
+
+
+def main() -> int:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        print(f"invalid JSON: {e}", file=sys.stderr)
+        return 1
+    items = data if isinstance(data, list) else data.get("bookmarks", [])
+    if not isinstance(items, list):
+        print("bookmarks must be a list", file=sys.stderr)
+        return 1
+    for it in items:
+        if not isinstance(it, dict):
+            print("each bookmark must be an object", file=sys.stderr)
+            return 1
+        for k in REQUIRED:
+            if not str(it.get(k, "")).strip():
+                print(f"missing required field: {k}", file=sys.stderr)
+                return 1
+        # Never persist secrets: refuse obvious secret fields.
+        for banned in ("password", "token", "private_key", "secret"):
+            if banned in it:
+                print(f"refused field: {banned}", file=sys.stderr)
+                return 1
+    tmp = DEST + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, DEST)
+    print(f"saved {len(items)} bookmarks")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

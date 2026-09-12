@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""bookomarchy-maintenance: backup / export / import / git-sync.
+
+All file paths stay inside ~/.config/omarchy/bookomarchy unless the user
+passes an explicit import/export path. No network, no secrets.
+"""
+import csv
+import html as htmlmod
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+DATA_DIR = os.path.join(HOME, ".config", "omarchy", "bookomarchy")
+SRC = os.path.join(DATA_DIR, "bookmarks.json")
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+
+BLOCKED_CMD = re.compile(r"(sudo\s|rm\s+-rf|chmod|chown|curl\s.*\|\s*sh|wget\s.*\|\s*sh|mkfs|dd\s+of=)", re.I)
+
+
+def load():
+    if not os.path.exists(SRC):
+        return []
+    with open(SRC, encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, list) else data.get("bookmarks", [])
+
+
+def save(items):
+    tmp = SRC + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, SRC)
+
+
+def cmd_backup(_args):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+    dest = os.path.join(BACKUP_DIR, f"bookomarchy-backup-{stamp}.json")
+    shutil.copy2(SRC, dest)
+    print(dest)
+
+
+def cmd_export_json(args):
+    dest = args[0] if args else os.path.join(DATA_DIR, "bookmarks-export.json")
+    dest = os.path.expanduser(dest)
+    shutil.copy2(SRC, dest)
+    print(dest)
+
+
+def cmd_export_html(args):
+    dest = args[0] if args else os.path.join(DATA_DIR, "bookmarks.html")
+    dest = os.path.expanduser(dest)
+    items = load()
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write("<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">\n<TITLE>BookOmarchy</TITLE>\n<H1>BookOmarchy</H1>\n<DL><p>\n")
+        for it in items:
+            url = htmlmod.escape(str(it.get("target", "")), quote=True)
+            title = htmlmod.escape(str(it.get("title", "")))
+            f.write(f'    <DT><A HREF="{url}">{title}</A>\n')
+        f.write("</DL><p>\n")
+    print(dest)
+
+
+def parse_html(text):
+    out = []
+    for m in re.finditer(r'<A\s[^>]*HREF="([^"]+)"[^>]*>([^<]+)</A>', text, re.I):
+        url, title = m.group(1).strip(), m.group(2).strip()
+        if not url or not title:
+            continue
+        bid = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or f"import-{len(out)}"
+        out.append({"id": bid, "title": title, "type": "url", "target": url,
+                    "category": "Imported", "aliases": [], "tags": [], "description": ""})
+    return out
+
+
+def cmd_import(args):
+    if not args:
+        print("usage: import <path.json|path.html|path.csv>", file=sys.stderr)
+        return 1
+    path = os.path.expanduser(args[0])
+    with open(path, encoding="utf-8", errors="replace") as f:
+        raw = f.read()
+    items = []
+    if path.endswith(".html"):
+        items = parse_html(raw)
+    elif path.endswith(".csv"):
+        for row in csv.DictReader(raw.splitlines()):
+            title = (row.get("title") or "").strip()
+            target = (row.get("target") or row.get("url") or "").strip()
+            if not title or not target:
+                continue
+            bid = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+            items.append({"id": bid or f"import-{len(items)}", "title": title, "type": "url",
+                          "target": target, "category": (row.get("category") or "Imported").strip() or "Imported",
+                          "aliases": [], "tags": [], "description": ""})
+    else:
+        data = json.loads(raw)
+        items = data if isinstance(data, list) else data.get("bookmarks", [])
+    existing = load()
+    seen = {str(x.get("id")) for x in existing}
+    added = 0
+    for it in items:
+        if not isinstance(it, dict) or not it.get("id") or not it.get("title") or not it.get("target"):
+            continue
+        if str(it["id"]) in seen:
+            continue
+        it.setdefault("type", "url")
+        it.setdefault("category", "Imported")
+        it.setdefault("aliases", [])
+        it.setdefault("tags", [])
+        it.setdefault("description", "")
+        existing.append(it)
+        seen.add(str(it["id"]))
+        added += 1
+    save(existing)
+    print(f"imported {added} of {len(items)}")
+    return 0
+
+
+def sh(*args, cwd=None):
+    return subprocess.run(args, cwd=cwd or DATA_DIR, capture_output=True, text=True)
+
+
+def cmd_git_sync(_args):
+    if not os.path.isdir(os.path.join(DATA_DIR, ".git")):
+        r = sh("git", "init")
+        if r.returncode != 0:
+            print(r.stderr.strip() or "git init failed", file=sys.stderr)
+            return 1
+    sh("git", "add", "bookmarks.json", "settings.json")
+    r = sh("git", "diff", "--cached", "--quiet")
+    if r.returncode != 0:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        sh("git", "-c", "user.name=bookomarchy", "-c", "user.email=bookomarchy@local", "commit", "-m", f"bookomarchy sync {stamp}")
+    # pull/push only if a remote exists; never fail hard offline.
+    rem = sh("git", "remote")
+    if rem.stdout.strip():
+        pull = sh("git", "pull", "--ff-only")
+        push = sh("git", "push")
+        print((pull.stdout + pull.stderr + push.stdout + push.stderr).strip()[-2000:] or "synced")
+    else:
+        print("committed locally (no git remote configured)")
+    return 0
+
+
+def main(argv):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if len(argv) < 2:
+        print("usage: backup|export-json|export-html|import|git-sync", file=sys.stderr)
+        return 2
+    action, rest = argv[1], argv[2:]
+    if action == "backup":
+        cmd_backup(rest)
+    elif action == "export-json":
+        cmd_export_json(rest)
+    elif action == "export-html":
+        cmd_export_html(rest)
+    elif action == "import":
+        return cmd_import(rest)
+    elif action == "git-sync":
+        return cmd_git_sync(rest)
+    else:
+        print(f"unknown action: {action}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
