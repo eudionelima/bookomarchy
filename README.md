@@ -11,11 +11,11 @@ ID: `eudionelima.bookomarchy` · kinds `menu` + `bar-widget` · `SUPER+B`
 <table>
   <tr>
     <td align="center"><b>Browse & Top10</b><br><img src="screenshots/browse.png" width="420"></td>
-    <td align="center"><b>Edit bookmark</b><br><img src="screenshots/edit-bookmark.png" width="420"></td>
+    <td align="center"><b>Delete</b><br><img src="screenshots/delete.png" width="420"></td>
   </tr>
   <tr>
+    <td align="center"><b>Edit bookmark</b><br><img src="screenshots/edit-bookmark.png" width="420"></td>
     <td align="center"><b>Manage</b><br><img src="screenshots/manage.png" width="420"></td>
-    <td align="center"><b>Delete confirm</b><br><img src="screenshots/delete.png" width="420"></td>
   </tr>
 </table>
 
