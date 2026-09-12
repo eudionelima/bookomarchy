@@ -2,9 +2,9 @@
 
 ![BookOmarchy](screenshot.jpg)
 
-Fast keyboard-first bookmarks and shortcuts for Omarchy.
+<h2 align="center">What it does</h2>
 
-ID: `eudionelima.bookomarchy` · kinds `menu` + `bar-widget` · `SUPER+B`
+BookOmarchy lives in the Omarchy bar and puts your bookmarks and shortcuts one keypress away: URLs, files, folders, apps, shell commands and SSH hosts in a fast keyboard-first menu (`SUPER+B`), with a self-learning Top10, fuzzy search, categories and automatic Zen Browser sync.
 
 <h2 align="center">Screenshots</h2>
 
@@ -21,108 +21,91 @@ ID: `eudionelima.bookomarchy` · kinds `menu` + `bar-widget` · `SUPER+B`
 
 <h2 align="center">Features</h2>
 
-- Search across title, URL/target, category, aliases, tags (`gh` → GitHub, `arch` → ArchWiki)
-- `Top10` default view: 10 most opened (favorites as tiebreak) — every launch bumps the counter, no mouse needed
-- `↑↓` navigate · `←→` or `[` `]` switch category · `1-9` quick-open · `Shift+Enter` opens a directory in the terminal
-- Quick-keys `1-9`: type `3` + `Enter` opens the 3rd visible row
-- Categories with `[` / `]` cycling + click filter
-- Types: `url` (browser), `file`/`directory` (`xdg-open`), `application` (app library), `command`/`ssh` (confirmed)
-- `Ctrl+N` new · `Ctrl+E` edit · `Del` delete · `Ctrl+D` favorite · `Ctrl+B` backup · `Ctrl+Y` zen-sync · `Ctrl+M` manage
-- Manage sem mouse: `↑↓←→` seleciona · `Enter` executa · `1-7` atalho direto · `Tab` vai ao campo de path · `Esc` volta
-- Formulário sem mouse: `Ctrl+[` / `Ctrl+]` troca o tipo (url/file/directory/application/command/ssh)
-- `Shift+Enter` on a directory opens it in the terminal
+- Fuzzy search across title, URL, category, aliases and tags (`gh` → GitHub)
+- Top10 default view: most opened first, favorites as tiebreak
+- Types: `url`, `file`, `directory`, `application`, `command`, `ssh` (commands always confirmed)
+- Zero-mouse operation: arrows, quick-keys `1-9`, `1-7` shortcuts in manage mode
+- Zen Browser auto-sync: new favorites appear on next open, never overwriting yours
 - Import Chrome/Firefox HTML, JSON, CSV · export JSON/HTML · timestamped backups · local git sync
-- Adapts to `omarchy theme set` live: all colors from `Color.menu.*`, spacing/type from `Style.*`
+- Follows `omarchy theme set` live, zero hardcoded colors
+
+<h2 align="center">Requirements</h2>
+
+- Omarchy Linux with the Quickshell bar
+- `python3` (standard library only, no dependencies)
 
 <h2 align="center">Install</h2>
 
-```bash
-# dev (local dir already in place)
-omarchy plugin validate ~/.config/omarchy/plugins/eudionelima.bookomarchy
-omarchy-shell shell rescanPlugins
-omarchy plugin enable eudionelima.bookomarchy
+Via Omarchy plugin manager:
 
-# from git (marketplace layout: manifest.json at repo root)
-omarchy plugin add https://github.com/<you>/bookomarchy --enable
+```bash
+omarchy plugin add https://github.com/eudionelima/bookomarchy --enable
 ```
 
-<h2 align="center">Use</h2>
+Manual:
 
 ```bash
-omarchy-shell shell summon eudionelima.bookomarchy '{}'
+git clone https://github.com/eudionelima/bookomarchy ~/.config/omarchy/plugins/eudionelima.bookomarchy
+omarchy plugin enable eudionelima.bookomarchy
+```
+
+<h2 align="center">Uninstall</h2>
+
+Via Omarchy plugin manager:
+
+```bash
+omarchy plugin remove eudionelima.bookomarchy
+```
+
+For manual installations, remove the plugin directory:
+
+```bash
+rm -rf ~/.config/omarchy/plugins/eudionelima.bookomarchy
+```
+
+User data stays in `~/.config/omarchy/bookomarchy/` — delete manually if wanted.
+
+<h2 align="center">Usage</h2>
+
+1. Press `SUPER+B` (or left-click the bar icon; right-click opens manage mode).
+2. Type to search, `↑↓` to navigate, `Enter` to open.
+3. `Ctrl+N` new · `Ctrl+E` edit · `Ctrl+M` manage · `Ctrl+Y` sync Zen · `Esc` close.
+
+```bash
+# summon with a filter, or straight into manage / add mode
 omarchy-shell shell summon eudionelima.bookomarchy '{"filter":"gh"}'
 omarchy-shell shell summon eudionelima.bookomarchy '{"mode":"manage"}'
-omarchy-shell shell summon eudionelima.bookomarchy '{"mode":"add"}'
 ```
-
-Hyprland:
-
-```ini
-bind = SUPER, B, exec, omarchy-shell shell toggle eudionelima.bookomarchy '{}'
-bind = SUPER SHIFT, B, exec, omarchy-shell shell summon eudionelima.bookomarchy '{"mode":"manage"}'
-```
-
-<h2 align="center">Bar icon</h2>
-
-Left-click the bookmark icon toggles the menu, right-click opens manage mode.
-The icon uses the bar's own foreground/font, so it follows every theme.
 
 ```bash
-omarchy plugin enable eudionelima.bookomarchy --section right
-```
-
-<h2 align="center">Data (never inside the plugin repo)</h2>
-
-```
-~/.config/omarchy/bookomarchy/
-  bookmarks.json
-  settings.json          # { "maxResults": 12, "confirmDelete": true, "confirmCommand": true, "zenSync": {...} }
-  backups/bookomarchy-backup-YYYY-MM-DD-HHMM.json
-```
-
-<h2 align="center">Zen sync (automático)</h2>
-
-Puxa favoritos do Zen Browser (`~/.config/zen`, Firefox-compatible) sem dependências extras.
-Lê `bookmarkbackups/*.jsonlz4` primeiro (sem lock) e cai para cópia via `sqlite3 backup` de `places.sqlite` se preciso. Só lê título/URL/pasta — nunca logins/cookies. Merge é por URL normalizada: URL nova entra com `tags: ["zen"]`, URL existente **mantém seu título/favorito/tags** do BookOmarchy.
-
-```bash
-bin/bookomarchy-maintenance zen-sync --dry-run
-bin/bookomarchy-maintenance zen-sync
-bin/bookomarchy-maintenance zen-sync --profile="Default (release)" --category=Zen
-```
-
-UI: botão `Sync Zen` no modo Manage + `Ctrl+Y` no browse + auto a cada abertura do menu (uma vez por abertura). Desligue em `settings.json`:
-
-```json
-{ "zenSync": { "enabled": true, "auto": true, "category": "Zen" } }
-```
-
-Exclusões (nunca importados, ex. bookmarks padrão do Firefox):
-```json
-{ "zenSync": { "exclude": ["support\\.mozilla\\.org", "mozilla\\.org/(contribute|about)"] } }
-```
-
-<h2 align="center">Maintenance CLI (same code the UI calls)</h2>
-
-```bash
+# maintenance CLI (same code the UI calls)
 bin/bookomarchy-maintenance backup
-bin/bookomarchy-maintenance export-json ~/Downloads/bookmarks.json
-bin/bookomarchy-maintenance export-html ~/Downloads/bookmarks.html
-bin/bookomarchy-maintenance import ~/Downloads/bookmarks.html
 bin/bookomarchy-maintenance zen-sync --dry-run
+bin/bookomarchy-maintenance import ~/Downloads/bookmarks.html
 bin/bookomarchy-maintenance git-sync
 ```
 
-<h2 align="center">Security</h2>
+<div align="center">
 
-See `SECURITY.md`. Summary: `url/file/dir/app` launch without shell;
-`command/ssh` always confirm; dangerous patterns refused; no secrets stored;
-saves go over stdin, never `bash -c` interpolation.
+| Keys | Action |
+| ---- | ------ |
+| `↑` `↓` | Navigate |
+| `←` `→` / `[` `]` | Switch category |
+| `Enter` | Open |
+| `Shift+Enter` | Open directory in terminal |
+| `1-9` | Quick open nth row |
+| `Ctrl+N` / `Ctrl+E` / `Del` | New / edit / delete |
+| `Ctrl+D` | Favorite |
+| `Ctrl+Y` | Sync Zen |
+| `Ctrl+M` | Manage |
+| `Esc` | Close |
 
-<h2 align="center">Remove</h2>
+</div>
 
-```bash
-omarchy plugin disable eudionelima.bookomarchy
-omarchy plugin remove eudionelima.bookomarchy
-# user data stays in ~/.config/omarchy/bookomarchy/ — delete manually if wanted
-```
+<h2 align="center">Note</h2>
+
+`command`/`ssh` entries always ask for confirmation and dangerous patterns are refused. No secrets are ever stored — user data lives only in `~/.config/omarchy/bookomarchy/`, never inside the plugin repo.
+
+<h2 align="center">License</h2>
+
+MIT — see [LICENSE](LICENSE).
