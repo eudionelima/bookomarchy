@@ -24,8 +24,8 @@ Item {
   property string mode: "browse"
   property bool opened: false
   property string filterText: ""
-  property string activeCategory: "All"
-  property var categories: ["All"]
+  property string activeCategory: "Top10"
+  property var categories: ["Top10"]
   property int selectedIndex: 0
   property bool cursorActive: true
   property var bookmarks: []
@@ -33,6 +33,10 @@ Item {
   property bool confirmDelete: true
   property bool confirmCommand: true
   property string statusMsg: ""
+  property bool zenSyncEnabled: true
+  property bool zenSyncAuto: true
+  property string zenSyncCategory: "Zen"
+  property bool zenAutoFired: false
 
   // form state
   property string editingId: ""
@@ -65,12 +69,13 @@ Item {
     if (root.mode === "add") root.startAdd();
     root.opened = true;
     root.rebuildDisplay();
+    root.maybeAutoZenSync();
     Qt.callLater(function() { keyCatcher.forceActiveFocus(); });
     return "ok";
   }
-  function close() { root.opened = false; root.mode = "browse"; return "ok"; }
+  function close() { root.zenAutoFired = false; root.opened = false; root.mode = "browse"; return "ok"; }
   function ping() { return "ok"; }
-  function refresh() { bookmarksFile.reload(); settingsFile.reload(); return "ok"; }
+  function refresh() { root.zenAutoFired = false; bookmarksFile.reload(); settingsFile.reload(); return "ok"; }
 
   // Theme tokens — never hardcode hex.
   property string fontFamily: Style.font.menuFamily
@@ -111,7 +116,7 @@ Item {
 
   function rebuildCategories() {
     root.categories = Bookmarks.categoriesOf(root.bookmarks);
-    if (root.categories.indexOf(root.activeCategory) < 0) root.activeCategory = "All";
+    if (root.categories.indexOf(root.activeCategory) < 0) root.activeCategory = "Top10";
   }
 
   function rebuildDisplay() {
@@ -119,6 +124,7 @@ Item {
     var rows = [];
     var query = root.filterText.trim();
     var quickNum = /^[1-9]$/.test(query) ? parseInt(query, 10) : 0;
+    var topMode = root.activeCategory === "Top10" && !query && !quickNum;
     for (var i = 0; i < root.bookmarks.length; i++) {
       var entry = root.bookmarks[i];
       if (!Bookmarks.matchesQuery(entry, quickNum ? "" : query, root.activeCategory)) continue;
@@ -130,11 +136,13 @@ Item {
         target: String(entry.target || ""),
         btype: String(entry.type || "url"),
         fav: entry.favorite === true,
+        opens: Number(entry.opens) || 0,
         num: n <= 9 ? String(n) : "",
         score: Bookmarks.searchScore(entry, quickNum ? "" : query)
       });
     }
-    rows = Bookmarks.sortRows(rows).slice(0, Math.max(1, root.maxResults));
+    if (topMode) rows = Bookmarks.topSort(rows).slice(0, 10);
+    else rows = Bookmarks.sortRows(rows).slice(0, Math.max(1, root.maxResults));
     // Renumber after sort so quick-keys match visible order.
     for (var k = 0; k < rows.length; k++) {
       rows[k].num = (k < 9) ? String(k + 1) : "";
@@ -166,6 +174,15 @@ Item {
     saveProc.running = true;
   }
 
+  // Top10 accounting: bump open counter on every real launch.
+  function markOpened(entry) {
+    if (!entry) return;
+    entry.opens = (Number(entry.opens) || 0) + 1;
+    saveProc.payload = JSON.stringify(root.bookmarks);
+    saveProc.pendingMsg = "";
+    saveProc.running = true;
+  }
+
   function isDangerousCommand(target) {
     return /(sudo\s|rm\s+-rf?\s+\/|chmod\s+(-R\s+)?777|chown\s+-R|curl\s.*\|\s*(sh|bash)|wget\s.*\|\s*(sh|bash)|mkfs|dd\s+of=|:\(\)\s*\{)/i.test(String(target || ""));
   }
@@ -175,10 +192,12 @@ Item {
     var t = String(entry.target || "");
     var type = String(entry.type || "url");
     if (type === "url") {
+      root.markOpened(entry);
       Util.execArgv(["xdg-open", Bookmarks.normalizeUrl(t)]);
       root.opened = false; root.filterText = "";
     } else if (type === "file" || type === "directory") {
       var p = root.expandPath(t);
+      root.markOpened(entry);
       if (type === "directory" && openInTerminal) {
         Util.execArgv(["xdg-terminal-exec", "--", "bash", "-lc", "cd " + "'" + p.replace(/'/g, "'\\''") + "' && exec \"${SHELL:-/bin/bash}\""]);
       } else {
@@ -186,6 +205,7 @@ Item {
       }
       root.opened = false; root.filterText = "";
     } else if (type === "application") {
+      root.markOpened(entry);
       if (root.appLibrary) {
         try { root.appLibrary.launch(t, String(entry.title || t)); } catch (e) { Util.execArgv([root.expandPath(t)]); }
       } else {
@@ -209,6 +229,7 @@ Item {
   function doLaunchConfirmed(entry, openInTerminal) {
     var t = String(entry.target || "");
     var type = String(entry.type || "url");
+    root.markOpened(entry);
     root.launchConfirmOpen = false;
     root.launchTarget = null;
     if (type === "ssh") {
@@ -273,7 +294,7 @@ Item {
     root.formTitle = "";
     root.formTarget = "";
     root.formType = "url";
-    root.formCategory = root.activeCategory !== "All" ? root.activeCategory : "";
+    root.formCategory = root.activeCategory !== "Top10" ? root.activeCategory : "";
     root.formAliases = "";
     root.formTags = "";
     root.formDescription = "";
@@ -365,11 +386,64 @@ Item {
     ioProc.running = true;
   }
 
+  function maybeAutoZenSync() {
+    if (root.zenSyncAuto && root.zenSyncEnabled && !root.zenAutoFired) {
+      root.zenAutoFired = true;
+      root.runMaintenance("zen-sync", "");
+    }
+  }
+
+  // Manage-mode keyboard support: no mouse needed.
+  property int manageIndex: 0
+  property var manageActions: [
+    { key: "export-json", label: "Export JSON" },
+    { key: "export-html", label: "Export HTML" },
+    { key: "import", label: "Import" },
+    { key: "backup", label: "Backup" },
+    { key: "zen-sync", label: "Sync Zen" },
+    { key: "git-sync", label: "Git Sync" }
+  ]
+  function manageCount() { return root.manageActions.length + 1; } // + Back
+  function moveManage(delta) {
+    var n = root.manageCount();
+    root.manageIndex = (root.manageIndex + delta + n) % n;
+  }
+  function activateManage(idx) {
+    if (idx === undefined) idx = root.manageIndex;
+    if (idx >= root.manageActions.length) { root.mode = "browse"; Qt.callLater(function() { keyCatcher.forceActiveFocus(); }); return; }
+    var k = root.manageActions[idx].key;
+    if (k === "import" && !root.managePath.trim()) { root.statusMsg = "Set an import path first (Tab to reach the path field)"; return; }
+    root.runMaintenance(k, (k === "import" || k === "export-json" || k === "export-html") ? root.expandPath(root.managePath.trim()) : "");
+  }
+  function openManage() {
+    root.mode = "manage";
+    root.manageIndex = 0;
+    Qt.callLater(function() { manageKeys.forceActiveFocus(); });
+  }
+
+  // Form type cycling without mouse: Ctrl+[ / Ctrl+]
+  property var formTypes: ["url", "file", "directory", "application", "command", "ssh"]
+  function cycleFormType(delta) {
+    var i = root.formTypes.indexOf(root.formType);
+    if (i < 0) i = 0;
+    root.formType = root.formTypes[(i + delta + root.formTypes.length) % root.formTypes.length];
+  }
+
   function formKey(event) {
     if (event.key === Qt.Key_Escape) {
       root.mode = "browse"; root.formError = "";
       event.accepted = true;
       Qt.callLater(function() { keyCatcher.forceActiveFocus(); });
+      return true;
+    }
+    if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_BracketLeft) {
+      root.cycleFormType(-1);
+      event.accepted = true;
+      return true;
+    }
+    if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_BracketRight) {
+      root.cycleFormType(1);
+      event.accepted = true;
       return true;
     }
     if ((event.modifiers & Qt.ControlModifier) && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
@@ -453,6 +527,11 @@ Item {
         if (s.maxResults) root.maxResults = Math.max(4, Math.min(50, Number(s.maxResults)));
         if (s.confirmDelete !== undefined) root.confirmDelete = !!s.confirmDelete;
         if (s.confirmCommand !== undefined) root.confirmCommand = !!s.confirmCommand;
+        if (s.zenSync && typeof s.zenSync === "object") {
+          if (s.zenSync.enabled !== undefined) root.zenSyncEnabled = !!s.zenSync.enabled;
+          if (s.zenSync.auto !== undefined) root.zenSyncAuto = !!s.zenSync.auto;
+          if (s.zenSync.category) root.zenSyncCategory = String(s.zenSync.category);
+        }
       } catch (e) {}
       if (root.opened) root.rebuildDisplay();
     }
@@ -505,7 +584,8 @@ Item {
           if (ctrl && event.key === Qt.Key_E) { root.startEditSelected(); event.accepted = true; return; }
           if (ctrl && event.key === Qt.Key_D) { root.toggleFavoriteSelected(); event.accepted = true; return; }
           if (ctrl && event.key === Qt.Key_B) { root.runMaintenance("backup"); event.accepted = true; return; }
-          if (ctrl && event.key === Qt.Key_M) { root.mode = "manage"; event.accepted = true; return; }
+          if (ctrl && event.key === Qt.Key_M) { root.openManage(); event.accepted = true; return; }
+          if (ctrl && event.key === Qt.Key_Y) { root.runMaintenance("zen-sync", ""); event.accepted = true; return; }
           if (event.key === Qt.Key_Delete) { root.requestDeleteSelected(); event.accepted = true; return; }
           if (event.key === Qt.Key_Escape) {
             if (root.filterText) root.setFilter("");
@@ -517,6 +597,8 @@ Item {
           if (Util.editsFilter(event, root.filterText)) { root.setFilter(Util.editedFilter(event, root.filterText)); event.accepted = true; return; }
           if (event.key === Qt.Key_Up) { root.select(-1); event.accepted = true; return; }
           if (event.key === Qt.Key_Down) { root.select(1); event.accepted = true; return; }
+          if (event.key === Qt.Key_Left) { root.cycleCategory(-1); event.accepted = true; return; }
+          if (event.key === Qt.Key_Right) { root.cycleCategory(1); event.accepted = true; return; }
           if (event.key === Qt.Key_PageUp) { root.select(-6); event.accepted = true; return; }
           if (event.key === Qt.Key_PageDown) { root.select(6); event.accepted = true; return; }
           if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
@@ -842,12 +924,27 @@ Item {
           }
         }
 
-        // Manage
+        // Manage — fully keyboard operable: arrows/Tab move, Enter runs, 1-7 quick.
         Column {
           visible: root.mode === "manage"
           width: parent.width
           spacing: Style.space(8)
+          Item {
+            id: manageKeys
+            width: 1; height: 1
+            focus: root.mode === "manage"
+            Keys.onPressed: function(event) {
+              var n = root.manageCount();
+              if (event.key === Qt.Key_Escape) { root.mode = "browse"; event.accepted = true; Qt.callLater(function() { keyCatcher.forceActiveFocus(); }); return; }
+              if (event.key === Qt.Key_Up || event.key === Qt.Key_Left) { root.moveManage(-1); event.accepted = true; return; }
+              if (event.key === Qt.Key_Down || event.key === Qt.Key_Right || event.key === Qt.Key_Tab) { root.moveManage(1); event.accepted = true; return; }
+              if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) { root.activateManage(); event.accepted = true; return; }
+              var num = parseInt(event.text, 10);
+              if (event.text && num >= 1 && num <= n) { root.manageIndex = num - 1; root.activateManage(); event.accepted = true; return; }
+            }
+          }
           TextField {
+            id: managePathField
             width: parent.width
             text: root.managePath
             placeholderText: "Import/export path — e.g. ~/Downloads/bookmarks.html"
@@ -855,42 +952,38 @@ Item {
             onTextChanged: root.managePath = text
             Keys.onPressed: function(e) {
               if (e.key === Qt.Key_Escape) { root.mode = "browse"; e.accepted = true; keyCatcher.forceActiveFocus(); }
+              else if (e.key === Qt.Key_Tab) { manageKeys.forceActiveFocus(); e.accepted = true; }
+              else if ((e.modifiers & Qt.ControlModifier) && (e.key === Qt.Key_Return || e.key === Qt.Key_Enter)) { root.activateManage(); e.accepted = true; }
             }
           }
           Flow {
             width: parent.width
             spacing: Style.space(8)
             Repeater {
-              model: [
-                { key: "export-json", label: "Export JSON" },
-                { key: "export-html", label: "Export HTML" },
-                { key: "import", label: "Import" },
-                { key: "backup", label: "Backup" },
-                { key: "git-sync", label: "Git Sync" }
-              ]
+              model: root.manageActions
               BorderSurface {
                 required property var modelData
+                required property int index
+                readonly property bool active: index === root.manageIndex
                 width: btnText.implicitWidth + Style.space(18)
                 height: Style.space(32)
                 radius: root.cornerRadius
-                color: "transparent"
-                borderSpec: Border.flat(Util.alpha(root.foreground, 0.38), Style.normalBorderWidth)
+                color: active ? root.selectedBackground : "transparent"
+                borderSpec: active ? root.selectedBorderSpec : Border.flat(Util.alpha(root.foreground, 0.38), Style.normalBorderWidth)
                 Text {
                   id: btnText
                   anchors.centerIn: parent
-                  text: modelData.label
-                  color: root.foreground
+                  text: (index + 1) + " · " + modelData.label
+                  color: active ? root.selectedText : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
                 MouseArea {
                   anchors.fill: parent
+                  hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    var k = modelData.key;
-                    if (k === "import" && !root.managePath.trim()) { root.statusMsg = "Set an import path first"; return; }
-                    root.runMaintenance(k, (k === "import" || k === "export-json" || k === "export-html") ? root.expandPath(root.managePath.trim()) : "");
-                  }
+                  onEntered: root.manageIndex = index
+                  onClicked: { root.manageIndex = index; root.activateManage(index); }
                 }
               }
             }
@@ -898,10 +991,11 @@ Item {
           BorderSurface {
             width: Style.space(110); height: Style.space(32)
             radius: root.cornerRadius
-            color: "transparent"
-            borderSpec: Border.flat(Util.alpha(root.foreground, 0.38), Style.normalBorderWidth)
-            Text { anchors.centerIn: parent; text: "Back  (Esc)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { root.mode = "browse"; keyCatcher.forceActiveFocus(); } }
+            readonly property bool active: root.manageIndex === root.manageActions.length
+            color: active ? root.selectedBackground : "transparent"
+            borderSpec: active ? root.selectedBorderSpec : Border.flat(Util.alpha(root.foreground, 0.38), Style.normalBorderWidth)
+            Text { anchors.centerIn: parent; text: "Back  (Esc)"; color: active ? root.selectedText : root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+            MouseArea { anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onEntered: root.manageIndex = root.manageActions.length; onClicked: { root.mode = "browse"; keyCatcher.forceActiveFocus(); } }
           }
         }
 
@@ -919,8 +1013,8 @@ Item {
         Text {
           width: parent.width
           text: root.mode === "browse"
-            ? "↑↓ Navigate  Enter Open  ⇧↵ Terminal  1-9 Quick  Ctrl+N New  Ctrl+E Edit  Del Delete  Ctrl+D ★  [ ] Category  Ctrl+M Manage  Esc"
-            : (root.mode === "manage" ? "Esc Back" : "Ctrl+↵ Save  Esc Cancel")
+            ? "↑↓ Navigate  ←→ Category  Enter Open  ⇧↵ Terminal  1-9 Quick  Ctrl+N New  Ctrl+E Edit  Del Delete  Ctrl+D ★  Ctrl+Y Zen  Ctrl+M Manage  Esc"
+            : (root.mode === "manage" ? "↑↓←→ Select  Enter Run  1-7 Quick  Tab Path  Esc Back" : "Ctrl+↵ Save  Ctrl+[ ] Type  Esc Cancel")
           color: root.foreground
           opacity: 0.45
           font.family: root.fontFamily

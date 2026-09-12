@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.0 — 2026-09-12
+
+- Zen Browser sync: new `zen-sync` in `bin/bookomarchy-maintenance`
+  (stdlib only, pure-Python LZ4 decode). Reads `bookmarkbackups/*.jsonlz4`
+  first (lock-free), falls back to a temp copy of `places.sqlite`
+  (never touches the live DB). Merge by normalized URL — existing
+  title/favorite/tags are never overwritten. Category rules
+  (cyber domains → `Cybersecurity`), `recategorize` command,
+  `zenSync.exclude` blocklist. Auto-sync on menu open (once per open),
+  manual via `Sync Zen` button or `Ctrl+Y`.
+- Top10 default view replaces `All`: 10 most opened (`opens` counter
+  bumped on every launch, favorites as tiebreak). Typing a query searches everything.
+- Keyboard: `←→` switch category in browse; manage mode fully keyboard
+  operable (`↑↓←→` select, `Enter` run, `1-7` quick, `Tab` path field);
+  `Ctrl+[`/`Ctrl+]` cycles type in add/edit forms.
+- Docs: hero `screenshot.jpg` + 2x2 `screenshots/` table in README,
+  OmaHack-style centered headings.
+
 ## 1.1.0 — 2026-09-12
 
 - Bar icon: new `bar-widget` kind (`BarWidget.qml`, bookmark glyph).

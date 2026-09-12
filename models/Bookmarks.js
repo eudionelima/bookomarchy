@@ -9,7 +9,7 @@ function searchable(entry) {
 }
 
 function matchesQuery(entry, query, activeCategory) {
-  if (activeCategory && activeCategory !== "All" && String(entry.category || "") !== activeCategory) return false;
+  if (activeCategory && activeCategory !== "Top10" && String(entry.category || "") !== activeCategory) return false;
   var q = String(query || "").trim().toLowerCase();
   if (!q) return true;
   // Numeric quick-key: "3" matches everything so Enter can open nth row.
@@ -47,9 +47,23 @@ function sortRows(rows) {
   });
 }
 
+// Top10 view: most opened first, favorites as tiebreak, then A-Z.
+function topSort(rows) {
+  return rows.sort(function(a, b) {
+    var ao = Number(a.opens) || 0, bo = Number(b.opens) || 0;
+    if (ao !== bo) return bo - ao;
+    if (!!a.fav !== !!b.fav) return a.fav ? -1 : 1;
+    var at = String(a.label || "").toLowerCase();
+    var bt = String(b.label || "").toLowerCase();
+    if (at < bt) return -1;
+    if (at > bt) return 1;
+    return 0;
+  });
+}
+
 function categoriesOf(bookmarks) {
   var seen = {};
-  var out = ["All"];
+  var out = ["Top10"];
   for (var i = 0; i < bookmarks.length; i++) {
     var c = String(bookmarks[i].category || "General");
     if (!seen[c]) { seen[c] = true; out.push(c); }

@@ -1,25 +1,100 @@
 #!/usr/bin/env python3
-"""bookomarchy-maintenance: backup / export / import / git-sync.
+"""bookomarchy-maintenance: backup / export / import / git-sync / zen-sync.
 
 All file paths stay inside ~/.config/omarchy/bookomarchy unless the user
 passes an explicit import/export path. No network, no secrets.
+Zen sync only reads bookmark title/url/folder — never logins/cookies.
 """
+import configparser
 import csv
+import glob
 import html as htmlmod
 import json
 import os
 import re
 import shutil
+import sqlite3
+import struct
 import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
 DATA_DIR = os.path.join(HOME, ".config", "omarchy", "bookomarchy")
 SRC = os.path.join(DATA_DIR, "bookmarks.json")
+SETTINGS = os.path.join(DATA_DIR, "settings.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+ZEN_BASE = os.path.join(HOME, ".config", "zen")
+
+# (pattern, category): first match wins. Applied to title+url on zen-sync
+# import AND by the `recategorize` command for existing items.
+DEFAULT_CATEGORY_RULES = [
+    ("hackthebox|tryhackme|hackmyvm|offsec|pwntilldawn|echoctf|vulnlab|"
+     "cyberseclabs|cybertalents|portswigger|pentesterlab|blueteam|"
+     "letsdefend|cyberdefenders|root-me|overthewire|picoctf|\\bctf\\b",
+     "Cybersecurity"),
+    ("github|gitlab|stackoverflow|archwiki|hyprland|omarchy", None),  # None = keep folder/default
+]
+
+
+# URLs/titles matching these regexes are never imported by zen-sync.
+# Customizable via settings.json -> zenSync.exclude (list of regex strings).
+DEFAULT_EXCLUDE = [
+    r"support\.mozilla\.org",
+    r"mozilla\.org/(contribute|about)",
+]
+
+
+def zen_excluded(title, url):
+    patterns = list(DEFAULT_EXCLUDE)
+    try:
+        zcfg = load_settings().get("zenSync") or {}
+        for p in zcfg.get("exclude") or []:
+            if isinstance(p, str) and p.strip():
+                patterns.append(p)
+    except Exception:
+        pass
+    hay = f"{title} {url}"
+    for pattern in patterns:
+        try:
+            if re.search(pattern, hay, re.I):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def category_rules():
+    extra = []
+    try:
+        zcfg = load_settings().get("zenSync") or {}
+        for r in zcfg.get("categoryRules") or []:
+            if isinstance(r, (list, tuple)) and len(r) == 2:
+                extra.append((r[0], r[1]))
+            elif isinstance(r, dict) and r.get("match"):
+                extra.append((r["match"], r.get("category")))
+    except Exception:
+        pass
+    return extra + DEFAULT_CATEGORY_RULES
+
+
+def rule_category(title, url, fallback):
+    hay = f"{title} {url}".lower()
+    for pattern, cat in category_rules():
+        if not cat:
+            continue
+        try:
+            if re.search(pattern, hay, re.I):
+                return cat
+        except re.error:
+            continue
+    return fallback
 
 BLOCKED_CMD = re.compile(r"(sudo\s|rm\s+-rf|chmod|chown|curl\s.*\|\s*sh|wget\s.*\|\s*sh|mkfs|dd\s+of=)", re.I)
+SKIP_SCHEMES = ("place:", "about:", "data:", "chrome:", "resource:",
+                "wyciwyg:", "moz-", "view-source:")
 
 
 def load():
@@ -31,11 +106,62 @@ def load():
 
 
 def save(items):
+    os.makedirs(DATA_DIR, exist_ok=True)
     tmp = SRC + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(items, f, ensure_ascii=False, indent=2)
         f.write("\n")
     os.replace(tmp, SRC)
+
+
+def load_settings():
+    if not os.path.exists(SETTINGS):
+        return {}
+    try:
+        with open(SETTINGS, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(s):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = SETTINGS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, SETTINGS)
+
+
+def normalize_url(t):
+    t = str(t or "").strip()
+    if re.match(r"^https?://", t, re.I):
+        pass
+    elif re.match(r"^[\w-]+(\.[\w-]+)+(/\S*)?$", t):
+        t = "https://" + t
+    # canonicalize for dedupe: lower host, strip trailing slash, strip utm
+    try:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        parts = urlsplit(t)
+        if parts.scheme in ("http", "https"):
+            netloc = parts.netloc.lower()
+            path = parts.path.rstrip("/") or ""
+            q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                 if not k.lower().startswith("utm_")]
+            return urlunsplit((parts.scheme.lower(), netloc, path,
+                               urlencode(q), ""))
+    except Exception:
+        pass
+    return t
+
+
+def slugify(title, existing_ids):
+    base = re.sub(r"[^a-z0-9]+", "-", str(title or "bookmark").lower()).strip("-") or "bookmark"
+    bid, n = base, 2
+    while bid in existing_ids:
+        bid = f"{base}-{n}"
+        n += 1
+    return bid
 
 
 def cmd_backup(_args):
@@ -123,6 +249,353 @@ def cmd_import(args):
     return 0
 
 
+# ---------------- Zen sync ----------------
+
+def zen_profiles():
+    """Return [(name, abspath)] from profiles.ini + any *.Default* dirs as fallback."""
+    out = []
+    ini = os.path.join(ZEN_BASE, "profiles.ini")
+    if os.path.exists(ini):
+        cp = configparser.ConfigParser()
+        try:
+            cp.read(ini, encoding="utf-8")
+            for sec in cp.sections():
+                if sec.lower().startswith("profile"):
+                    path = (cp[sec].get("Path") or "").strip()
+                    is_rel = (cp[sec].get("IsRelative") or "1").strip() == "1"
+                    name = (cp[sec].get("Name") or path).strip() or path
+                    full = os.path.join(ZEN_BASE, path) if is_rel else path
+                    if full and os.path.isdir(full):
+                        out.append((name, full))
+        except Exception:
+            pass
+    if not out:
+        for d in glob.glob(os.path.join(ZEN_BASE, "*.Default*")):
+            if os.path.isdir(d):
+                out.append((os.path.basename(d), d))
+    return out
+
+
+def pick_zen_profile(want):
+    profiles = zen_profiles()
+    if not profiles:
+        return None, None
+    if want:
+        want = want.lower()
+        for name, path in profiles:
+            if want in name.lower() or want in os.path.basename(path).lower():
+                return name, path
+        # treat as direct path
+        if os.path.isdir(os.path.expanduser(want)):
+            return os.path.basename(want), os.path.expanduser(want)
+    # prefer profile with biggest places.sqlite
+    best, best_sz = profiles[0], -1
+    for item in profiles:
+        p = os.path.join(item[1], "places.sqlite")
+        try:
+            sz = os.path.getsize(p)
+        except OSError:
+            sz = -1
+        if sz > best_sz:
+            best, best_sz = item, sz
+    return best
+
+
+def lz4_block_decompress(raw):
+    """Pure-python LZ4 block decompressor (no frame). Raises on corrupt data."""
+    n = len(raw)
+    pos = 0
+    out = bytearray()
+
+    def read_u16(p):
+        return raw[p] | (raw[p + 1] << 8)
+
+    while pos < n:
+        token = raw[pos]
+        pos += 1
+        lit_len = token >> 4
+        if lit_len == 15:
+            while True:
+                if pos >= n:
+                    raise ValueError("truncated literal length")
+                b = raw[pos]
+                pos += 1
+                lit_len += b
+                if b != 255:
+                    break
+        if pos + lit_len > n:
+            raise ValueError("truncated literals")
+        out.extend(raw[pos:pos + lit_len])
+        pos += lit_len
+        if pos >= n:
+            break  # last literals
+        if pos + 2 > n:
+            raise ValueError("truncated offset")
+        offset = read_u16(pos)
+        pos += 2
+        if offset == 0 or offset > len(out):
+            raise ValueError("bad offset")
+        match_len = token & 0xF
+        if match_len == 15:
+            while True:
+                if pos >= n:
+                    raise ValueError("truncated match length")
+                b = raw[pos]
+                pos += 1
+                match_len += b
+                if b != 255:
+                    break
+        match_len += 4
+        start = len(out) - offset
+        for _ in range(match_len):
+            out.append(out[start])
+            start += 1
+    return bytes(out)
+
+
+def read_jsonlz4(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:8] != b"mozLz40\0":
+        raise ValueError("not mozlz4")
+    body = data[8:]
+    # Firefox variants: some files prefix the LZ4 block with the
+    # 4-byte LE uncompressed size. Try both, prefer lz4 lib when present.
+    candidates = [body]
+    if len(body) > 4:
+        candidates.append(body[4:])
+    try:
+        import lz4.block as lz4b  # faster when available
+        last_err = None
+        for c in candidates:
+            try:
+                return json.loads(lz4b.decompress(c).decode("utf-8"))
+            except Exception as e:
+                last_err = e
+        raise last_err
+    except ImportError:
+        last_err = None
+        for c in candidates:
+            try:
+                return json.loads(lz4_block_decompress(c).decode("utf-8"))
+            except Exception as e:
+                last_err = e
+        raise last_err
+
+
+def walk_ff_bookmarks(node, folder, out):
+    """Recursively collect (title, url, folder) from Firefox bookmark JSON."""
+    if isinstance(node, list):
+        for c in node:
+            walk_ff_bookmarks(c, folder, out)
+        return
+    if not isinstance(node, dict):
+        return
+    ntype = node.get("type") or node.get("typeCode")
+    if ntype in ("text/x-moz-place-container", 2):
+        title = str(node.get("title") or "").strip()
+        # skip root pseudo-folders, keep real ones
+        next_folder = folder
+        if title and node.get("root") not in ("placesRoot",):
+            # toolbar/menu/other are real folders but noisy; keep them
+            next_folder = title if folder in ("", "root") else folder + " / " + title
+        for c in node.get("children", []) or []:
+            walk_ff_bookmarks(c, next_folder, out)
+    elif ntype in ("text/x-moz-place", 1):
+        url = str(node.get("uri") or "").strip()
+        title = str(node.get("title") or "").strip() or url
+        if not url or url.startswith(SKIP_SCHEMES):
+            return
+        out.append((title, url, folder or "Zen"))
+    else:
+        for c in node.get("children", []) or []:
+            walk_ff_bookmarks(c, folder, out)
+
+
+def zen_from_backup(profile_path):
+    bdir = os.path.join(profile_path, "bookmarkbackups")
+    cands = sorted(glob.glob(os.path.join(bdir, "*.jsonlz4")),
+                   key=lambda p: os.path.getmtime(p), reverse=True)
+    if not cands:
+        return [], None
+    latest = cands[0]
+    try:
+        doc = read_jsonlz4(latest)
+    except Exception as e:
+        print(f"zen backup unreadable ({e}), trying places.sqlite", file=sys.stderr)
+        return [], None
+    out = []
+    # doc may be root node or {"children": [...]}
+    walk_ff_bookmarks(doc, "", out)
+    return out, latest
+
+
+def zen_from_sqlite(profile_path):
+    src = os.path.join(profile_path, "places.sqlite")
+    if not os.path.exists(src):
+        return [], None
+    # Never touch the live DB: copy sqlite+wal+shm to temp and read the
+    # copy read-only with a short timeout so a locked browser fails fast.
+    tmpdir = tempfile.mkdtemp(prefix="bookomarchy-zen-")
+    tmp_db = os.path.join(tmpdir, "places.sqlite")
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            p = src + suffix
+            if os.path.exists(p):
+                try:
+                    shutil.copy2(p, tmp_db + suffix)
+                except OSError as e:
+                    print(f"zen copy failed ({e})", file=sys.stderr)
+                    return [], None
+        try:
+            con = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True, timeout=2)
+        except Exception as e:
+            print(f"zen places.sqlite open failed ({e})", file=sys.stderr)
+            return [], None
+        try:
+            cur = con.cursor()
+            cur.execute(
+                "SELECT b.title, p.url, COALESCE(f.title,'') "
+                "FROM moz_bookmarks b JOIN moz_places p ON b.fk = p.id "
+                "LEFT JOIN moz_bookmarks f ON b.parent = f.id "
+                "WHERE b.type = 1 AND p.url NOT LIKE 'place:%'")
+            rows = [(str(t or u).strip() or u.strip(), u.strip(), str(fl or "").strip() or "Zen")
+                    for (t, u, fl) in cur.fetchall()
+                    if u and u.strip() and not u.startswith(SKIP_SCHEMES)]
+            return rows, src
+        except Exception as e:
+            print(f"zen places.sqlite query failed ({e})", file=sys.stderr)
+            return [], None
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def cmd_zen_sync(args):
+    want_profile = None
+    category_override = None
+    dry_run = False
+    for a in args:
+        if a == "--dry-run":
+            dry_run = True
+        elif a.startswith("--profile="):
+            want_profile = a.split("=", 1)[1]
+        elif a.startswith("--category="):
+            category_override = a.split("=", 1)[1]
+        elif a.startswith("--"):
+            print(f"unknown flag: {a}", file=sys.stderr)
+            return 2
+        elif want_profile is None:
+            want_profile = a
+    name, path = pick_zen_profile(want_profile)
+    if not path:
+        print("zen profile not found (~/.config/zen)", file=sys.stderr)
+        return 1
+    # Query BOTH sources (backup is lock-free but can be stale; sqlite copy
+    # is live) and union by normalized URL — live sqlite wins on conflicts.
+    b_items, b_src = zen_from_backup(path)
+    s_items, s_src = zen_from_sqlite(path)
+    merged = {}
+    for title, url, folder in b_items + s_items:
+        key = normalize_url(url).lower()
+        if not key or key in merged or zen_excluded(title, url):
+            continue
+        merged[key] = (title, url, folder)
+    # prefer live sqlite titles when the same URL exists in both
+    for title, url, folder in s_items:
+        key = normalize_url(url).lower()
+        if key in merged:
+            merged[key] = (title, url, folder)
+    items = list(merged.values())
+    source = s_src or b_src
+    if not items and not source:
+        print("no zen bookmarks source (backup + places.sqlite unavailable)", file=sys.stderr)
+        return 1
+    settings = load_settings()
+    zcfg = settings.get("zenSync") if isinstance(settings.get("zenSync"), dict) else {}
+    default_cat = category_override or (zcfg.get("category") if isinstance(zcfg, dict) else None) or "Zen"
+
+    existing = load()
+    seen_url = {}
+    for x in existing:
+        if str(x.get("type", "url")) == "url":
+            seen_url[normalize_url(x.get("target", "")).lower()] = x
+    ids = {str(x.get("id")) for x in existing}
+    fresh = []
+    for title, url, folder in items:
+        norm = normalize_url(url)
+        if not norm or norm.lower() in seen_url:
+            continue  # keep user's title/meta — never overwrite
+        bid = slugify(title, ids)
+        ids.add(bid)
+        cat = default_cat if folder in ("", "root") else folder
+        cat = rule_category(title, norm, cat)
+        fresh.append({"id": bid, "title": title, "type": "url", "target": norm,
+                      "category": cat, "aliases": [], "tags": ["zen"],
+                      "description": f"Zen import ({name})"})
+        seen_url[norm.lower()] = fresh[-1]
+    if dry_run:
+        print(f"zen-sync dry-run [{name}]: {len(fresh)} new, {len(items)} in zen, {len(existing)} in bookomarchy")
+        return 0
+    if fresh:
+        cmd_backup([])
+        save(existing + fresh)
+    settings.setdefault("zenSync", {})
+    if isinstance(settings["zenSync"], dict):
+        settings["zenSync"]["lastSync"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        settings["zenSync"]["lastSource"] = source or ""
+        settings["zenSync"]["lastAdded"] = len(fresh)
+        save_settings(settings)
+    print(f"zen-sync [{name}]: imported {len(fresh)} of {len(items)}")
+    return 0
+
+
+def zen_source_mtime():
+    settings = load_settings()
+    zcfg = settings.get("zenSync") if isinstance(settings.get("zenSync"), dict) else {}
+    if isinstance(zcfg, dict) and zcfg.get("enabled") is False:
+        return None
+    _, path = pick_zen_profile((zcfg.get("profile") if isinstance(zcfg, dict) else None) or None)
+    if not path:
+        return None
+    mtimes = []
+    for p in glob.glob(os.path.join(path, "bookmarkbackups", "*.jsonlz4")):
+        try:
+            mtimes.append(os.path.getmtime(p))
+        except OSError:
+            pass
+    try:
+        mtimes.append(os.path.getmtime(os.path.join(path, "places.sqlite")))
+    except OSError:
+        pass
+    return max(mtimes) if mtimes else None
+
+
+def cmd_recategorize(_args):
+    """Apply category rules to existing items (backup first)."""
+    existing = load()
+    changed = []
+    for x in existing:
+        if str(x.get("type", "url")) != "url":
+            continue
+        want = rule_category(x.get("title", ""), x.get("target", ""), x.get("category", "General"))
+        if want and want != x.get("category"):
+            x["category"] = want
+            changed.append(x.get("id"))
+    if changed:
+        cmd_backup([])
+        save(existing)
+    print(f"recategorized {len(changed)}: {', '.join(changed) if changed else '-'}")
+    return 0
+
+
 def sh(*args, cwd=None):
     return subprocess.run(args, cwd=cwd or DATA_DIR, capture_output=True, text=True)
 
@@ -152,7 +625,7 @@ def cmd_git_sync(_args):
 def main(argv):
     os.makedirs(DATA_DIR, exist_ok=True)
     if len(argv) < 2:
-        print("usage: backup|export-json|export-html|import|git-sync", file=sys.stderr)
+        print("usage: backup|export-json|export-html|import|git-sync|zen-sync|recategorize|zen-source-mtime", file=sys.stderr)
         return 2
     action, rest = argv[1], argv[2:]
     if action == "backup":
@@ -165,6 +638,13 @@ def main(argv):
         return cmd_import(rest)
     elif action == "git-sync":
         return cmd_git_sync(rest)
+    elif action == "zen-sync":
+        return cmd_zen_sync(rest)
+    elif action == "recategorize":
+        return cmd_recategorize(rest)
+    elif action == "zen-source-mtime":
+        m = zen_source_mtime()
+        print(int(m) if m else 0)
     else:
         print(f"unknown action: {action}", file=sys.stderr)
         return 2
