@@ -15,7 +15,7 @@ BarWidget {
     bar: root.bar
     text: ""
     fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-    fontSize: Style.font.title * 1.5
+    fontSize: Style.bar.iconFont
     horizontalMargin: 7.5
     tooltipText: "BookOmarchy — left: open, right: manage"
     onPressed: function(pressedButton) {
