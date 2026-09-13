@@ -46,6 +46,11 @@ anywhere in the plugin's own execution path:
   again at startup.
   (`command`/`ssh` bookmarks still open in the user's terminal via
   `xdg-terminal-exec`, but only after the explicit ConfirmDialog above.)
+- Bar widget IPC (`BarWidget.qml`) uses a dedicated `Process` with
+  `clearEnvironment: true` and an explicit allowlist (`PATH`,
+  `OMARCHY_PATH`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`). The command is
+  an absolute argv vector (`/usr/bin/omarchy-shell`) — no `bar.run()`
+  shell-string delegation, no ambient `PATH` resolution.
 - Hard wall-clock timeout per action via `SIGALRM`
   (save 15s, maintenance 30s, `import` 60s, `zen-sync` 90s);
   `git` subprocess calls additionally carry a 30s timeout.

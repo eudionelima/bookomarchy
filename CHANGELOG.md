@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.4 — 2026-09-13
+
+- Review round 3: `BarWidget.qml` no longer uses `root.bar.run()` (which
+  delegates to `Util.execDetached → bash -lc` under the full inherited
+  environment). A dedicated `Process` with `clearEnvironment: true`, an
+  explicit `environment` allowlist (`PATH`, `OMARCHY_PATH`,
+  `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`), and an absolute argv vector
+  (`/usr/bin/omarchy-shell`) now handles the IPC calls. The inherited
+  loader/env variables are gone before the first executable loads,
+  matching the boundary already established for `saveProc`/`ioProc`.
+
 ## 1.2.3 — 2026-09-12
 
 - Review round 2: QML `Process` now sets `clearEnvironment: true` with an
